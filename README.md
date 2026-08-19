@@ -1,0 +1,326 @@
+# NbaPredictionMarket — Phase 1: Historical Data Foundation
+
+A reproducible, auditable ingestion layer for NBA game results and Kalshi NBA
+game-winner market metadata, plus a deterministic join between the two.
+
+**Phase 1 scope only.** There is deliberately no model, no frontend, no
+database service, no trading logic, and no execution system here. The goal is a
+dataset you can *trust* before anything is built on top of it.
+
+## What it does
+
+1. Downloads every NBA game for a season from **BALLDONTLIE** (`GET /v1/games`).
+2. Downloads every **Kalshi** `KXNBAGAME` market from *both* Kalshi stores
+   (the historical archive and the live markets endpoint) and deduplicates them.
+3. Preserves every raw API response verbatim under `data/raw/`.
+4. Normalizes both sources into clean, typed tables.
+5. Matches NBA games to Kalshi events on `(scheduled date, unordered team pair)`.
+6. Writes a match report classifying every record as matched, unmatched, or
+   ambiguous — with counts and examples.
+
+## Setup
+
+Requires Python 3.11+.
+
+```bash
+git clone <this repo> && cd NbaPredictionMarket
+
+python3 -m venv .venv
+source .venv/bin/activate          # Windows: .venv\Scripts\activate
+
+pip install -e ".[dev]"            # omit [dev] if you don't need tests/lint
+```
+
+### Configure credentials
+
+```bash
+cp .env.example .env
+```
+
+Then edit `.env` and set your key:
+
+```
+BALLDONTLIE_API_KEY=your_key_here
+```
+
+Get a free key at <https://app.balldontlie.io>. **Kalshi needs no credentials** —
+the market metadata endpoints used here are public.
+
+`.env` is gitignored. The key is also read from the plain environment, so
+`BALLDONTLIE_API_KEY=... python -m ...` works too.
+
+### Troubleshooting: `No module named 'nba_prediction_market'`
+
+If the editable install succeeds but the import still fails, the `.pth` file
+that `pip install -e .` writes has probably picked up macOS's hidden flag —
+Python 3.13's `site.py` silently skips hidden `.pth` files:
+
+```bash
+ls -lO .venv/lib/python3.13/site-packages/*.pth   # look for "hidden"
+chflags nohidden .venv/lib/python3.13/site-packages/*.pth
+```
+
+On some macOS setups something re-applies that flag, in which case set the path
+explicitly instead — this always works and needs no install at all:
+
+```bash
+PYTHONPATH=src python -m nba_prediction_market.pipelines.build_dataset --season 2025
+```
+
+`pytest` is unaffected either way: the repo-root `conftest.py` puts `src` on the
+path directly.
+
+## Run Phase 1
+
+One command runs the whole pipeline:
+
+```bash
+python -m nba_prediction_market.pipelines.build_dataset --season 2025
+```
+
+`--season 2025` means the **2025-26** season (BALLDONTLIE labels a season by its
+starting year). The pipeline verifies this from the returned dates and *fails*
+rather than proceeding if they don't look like the requested season.
+
+An installed console script is equivalent:
+
+```bash
+nba-pm-build --season 2025
+```
+
+### Options
+
+| Flag | Default | Purpose |
+| --- | --- | --- |
+| `--season` | `2025` | BALLDONTLIE season start year |
+| `--series-ticker` | `KXNBAGAME` | Kalshi series to ingest |
+| `--data-dir` | `data` | Root for raw/processed/report output |
+| `--no-csv` | off | Write only parquet, skip the CSV copies |
+| `--log-level` | `INFO` | `DEBUG` / `INFO` / `WARNING` / `ERROR` |
+
+A full run takes a few minutes, almost entirely because the BALLDONTLIE free
+tier allows 5 requests/minute and the client throttles itself to stay under it.
+
+## Output files
+
+```
+data/
+  raw/
+    nba/      balldontlie_games_season_2025_<UTC timestamp>.json
+    kalshi/   kalshi_markets_KXNBAGAME_<UTC timestamp>.json
+              kalshi_events_KXNBAGAME_<UTC timestamp>.json
+              kalshi_historical_cutoff_<UTC timestamp>.json
+  processed/
+    nba_games_2025_26.parquet          (+ .csv)
+    kalshi_nba_markets_2025_26.parquet (+ .csv)
+    nba_kalshi_matches_2025_26.parquet (+ .csv)
+    kalshi_nba_events_2025_26.parquet  (+ .csv)
+  reports/
+    match_report.json
+```
+
+Parquet is canonical (it preserves types); the CSVs are convenience copies.
+Raw files are timestamped per run and never overwritten, so any processed table
+can be rebuilt without re-hitting the APIs. **Everything under `data/` is
+gitignored** — it is all regenerable.
+
+### The tables
+
+**`nba_games_*`** — one row per NBA game: source id, date, `tipoff_utc`, season,
+status, period, `postseason`, both teams (id / abbreviation / full name /
+canonical code), both scores, and `home_win`.
+
+`home_win` is populated **only** when the game is final *and* both scores are
+present *and* they are not level. Anything else stays null. Nothing is inferred.
+
+**`kalshi_nba_markets_*`** — one row per Kalshi market (two per game, one per
+team): ticker, event ticker, titles, `open_time_utc` / `close_time_utc` /
+`expiration_time_utc` / `settlement_ts_utc`, status, result, volume, liquidity,
+prices, plus derived `home_team_code` / `away_team_code` / `market_team_code`
+and `market_team_is_home`.
+
+**`kalshi_nba_events_*`** — the markets collapsed to one row per game-event,
+with `home_market_ticker` and `away_market_ticker` side by side.
+
+**`nba_kalshi_matches_*`** — the join. Every NBA game and every Kalshi event
+appears at least once, classified as `matched`, `unmatched_nba`,
+`unmatched_kalshi`, or `ambiguous`.
+
+Attaching a Kalshi price to a game later is a filter plus a lookup:
+
+```python
+import pandas as pd
+
+matches = pd.read_parquet("data/processed/nba_kalshi_matches_2025_26.parquet")
+usable = matches[matches["match_status"] == "matched"]
+# usable["kalshi_home_market_ticker"] -> the ticker to pull candlesticks for
+```
+
+**`match_report.json`** — counts per category, up to five worked examples of
+each, per-tier match counts, cross-source quality checks, the season
+verification result, and provenance for every raw file the run wrote.
+
+## Matching
+
+The join key is **`(scheduled game date, unordered pair of canonical team
+codes)`** — e.g. `2025-10-21|HOU|OKC`.
+
+* Both sources label a game by its **local scheduled date** (BALLDONTLIE in
+  `date`, Kalshi in the settlement rules text), so no timezone shifting is
+  applied to the key. All *timestamps* are UTC.
+* The team pair is **unordered on purpose**. Home/away is recorded and compared
+  afterwards (`orientation_agrees`), so a disagreement surfaces as a flag rather
+  than silently dropping an otherwise obvious match.
+* **Tier 1** matches only when exactly one game and exactly one event share a key.
+* **Tier 2** allows a ±1 calendar-day difference for the same team pair, and only
+  fires when the pairing is *mutually* unique among still-unmatched records.
+* Any remaining many-to-one or one-to-many group is reported `ambiguous` **in
+  full**, with every candidate listed. A match is never chosen arbitrarily.
+
+Matched rows also carry `settlement_agrees_with_score`, which cross-checks the
+Kalshi settlement against the final NBA score.
+
+Team names resolve through an **exact** alias table covering all 30 franchises
+(`matching/team_names.py`). There is no fuzzy matching and no "closest match".
+A string either resolves to exactly one franchise or it resolves to nothing.
+`"Los Angeles"` and `"LA"` resolve to `ambiguous` rather than picking a side.
+An unrecognised NBA team **fails the run** instead of being dropped.
+
+## Tests
+
+```bash
+pytest                  # unit tests only (no network)
+pytest --cov            # with coverage
+ruff check .            # lint
+```
+
+Unit tests never touch the network — HTTP is served by `httpx.MockTransport`,
+and the fixtures in `tests/conftest.py` are trimmed copies of real captured
+responses. They cover pagination, retry/rate-limit behaviour, team
+normalization, matching (including ambiguity and determinism), duplicate
+handling, and the pipeline end to end.
+
+Live smoke tests are marked `integration` and deselected by default:
+
+```bash
+pytest -m integration   # hits the real APIs; needs BALLDONTLIE_API_KEY
+```
+
+They assert the *shape* of the responses, so an upstream schema change gets
+caught rather than silently corrupting a dataset.
+
+## Verified API behaviour
+
+Checked against the live APIs on 2026-08-19. These are the non-obvious findings
+the code is built around:
+
+**BALLDONTLIE**
+
+* Auth is a **bare API key** in the `Authorization` header — no `Bearer` prefix.
+* Cursor pagination via `meta.next_cursor`; `per_page` caps at 100.
+* Season `2025` returns the 2025-26 season. The pipeline verifies this from the
+  returned dates rather than trusting the label.
+
+**Kalshi**
+
+* `GET /markets?status=all` is **rejected with HTTP 400** despite appearing in
+  the docs. Omitting the filter entirely returns every status, so that is what
+  the client does.
+* `no_sub_title` **equals** `yes_sub_title` on every market observed. It does
+  *not* name the opposing team, so it cannot be used to derive an opponent.
+  An integration test guards this.
+* `occurrence_datetime` is only populated for postseason markets, so it cannot
+  be the primary date field. The scheduled date comes from the settlement rules
+  text (which carries an explicit year), cross-checked against the event ticker.
+* Market titles use **two** formats: `"A at B Winner?"` (orientation implied) and
+  `"A vs B Winner?"` (no orientation). Orientation is therefore taken from the
+  event's `sub_title` (`"NYK at SAS (Jun 13)"`, abbreviations, complete
+  coverage), with the structured event ticker as fallback.
+* The `KXNBAGAME` archive spans **multiple seasons** and is not season-filterable
+  server-side, so markets are scoped client-side to the season window.
+
+## Phase 1 run results (2025-26)
+
+From a live run on 2026-08-19 (`--season 2025`):
+
+| | Count |
+| --- | --- |
+| NBA games | 1,322 (85 postseason, all final) |
+| Kalshi `KXNBAGAME` markets | 2,726 (1,363 events) |
+| **matched** | **1,317** (99.6% of NBA games, 96.6% of Kalshi events) |
+| unmatched NBA | 5 |
+| unmatched Kalshi | 46 |
+| ambiguous | 0 |
+
+1,316 matches were exact; 1 came from the ±1 day tier (GSW at MIN, labelled
+Jan 24 by Kalshi and Jan 25 by BALLDONTLIE).
+
+**Independent validation:** on all 1,317 matched rows the Kalshi settlement
+agrees with the NBA final score, and home/away orientation agrees. Zero
+disagreements. That is a strong signal the join is correct, since the two
+sources settle those fields independently.
+
+Every unmatched record has an identified cause:
+
+* **43 Kalshi events, Oct 10-17 2025** — preseason. The regular season opened
+  Oct 21, and BALLDONTLIE's `seasons[]=2025` does not return preseason games.
+* **3 Kalshi events with real volume and no NBA game anywhere near them** —
+  MIA at CHI (Jan 8), DAL at MIL (Jan 25), DEN at MEM (Jan 25). Each has
+  1.0-1.7M volume, and BALLDONTLIE has no game for that pair within five days.
+  Most likely postponed fixtures that Kalshi listed and the schedule later moved
+  (CHI/MIA subsequently played three times in eight days). **Worth review.**
+* **1 NBA game** — SAS at NYK, 2025-12-16, `ist_stage = "Championship"`: the NBA
+  Cup final. It carries `postseason = False` and has no `KXNBAGAME` event.
+* **4 NBA games** — all four are the **Game 7** of their series (BOS/PHI May 2,
+  CLE/TOR May 3, DET/ORL May 3, CLE/DET May 17). In each case Kalshi's
+  `KXNBAGAME` series stops at Game 6. **Worth review** — if Game 7s live under a
+  different series ticker, that series needs ingesting too.
+* **2 markets flagged `is_nba_matchup = False`** — a Guangzhou (`GUA`)
+  exhibition against Minnesota. Correctly excluded from matching rather than
+  forced onto a canonical team.
+
+## Known limitations & assumptions to review
+
+* **Season window.** A season is assumed to fall entirely within 1 Jul (year N)
+  through 30 Jun (year N+1). Kalshi's archive is one undated multi-season
+  stream, so *some* explicit window is unavoidable. It is defined in
+  `config.season_window` and tested, not buried in the matcher.
+* **±1 day matching tier.** Justified by the two sources occasionally labelling
+  a late tip-off on adjacent calendar days. It is deliberately narrow and
+  requires mutual uniqueness, but it is a judgement call — the report breaks out
+  how many matches came from it (`match_tiers`), and that number is worth
+  eyeballing after every run.
+* **Event ticker team codes are assumed to be away-then-home** (`...NYKSAS` =
+  NYK at SAS). Verified against every market whose title uses the `"A at B"`
+  form, with zero counter-examples, and cross-checked against the event
+  `sub_title` per row.
+* **Team codes in tickers are assumed to be exactly three characters.** A
+  flexible width would split `NYKSAS` incorrectly. Non-conforming tickers parse
+  to "unknown" rather than to a guess.
+* **Non-NBA opponents exist in the series.** The archive contains at least one
+  exhibition against a non-NBA club, whose code is not in the canonical map.
+  Such markets are flagged `is_nba_matchup = False` and get no matchup key, so
+  they can never match a game.
+* **Kalshi price fields are metadata snapshots**, not a pregame price. They are
+  whatever the market last showed. Deriving an actual pregame price needs
+  candlesticks — the next task.
+* **No candlestick / time-series data yet.** Phase 1 is metadata only.
+* **Rate limiting is a fixed minimum interval**, tuned to the BALLDONTLIE free
+  tier (12.5s). A paid tier can go much faster via
+  `BALLDONTLIE_MIN_INTERVAL_SECONDS`.
+
+## Layout
+
+```
+src/nba_prediction_market/
+  config.py                     settings, paths, season conventions
+  clients/base.py               timeouts, retries, rate limiting, pagination
+  clients/balldontlie.py        GET /v1/games
+  clients/kalshi.py             both market stores + events + cutoff
+  ingestion/raw_store.py        verbatim raw-payload persistence
+  ingestion/nba_games.py        game normalization + season verification
+  ingestion/kalshi_markets.py   market normalization + field derivation
+  matching/team_names.py        30 franchises, exact aliases, no fuzzy matching
+  matching/game_market_matcher.py   deterministic join + classification
+  pipelines/build_dataset.py    CLI entry point
+```

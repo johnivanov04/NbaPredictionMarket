@@ -1,0 +1,27 @@
+# Secrets
+.env
+
+# Generated / raw data (reproducible from the APIs)
+data/
+!data/.gitkeep
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+build/
+dist/
+
+# Tooling caches
+.pytest_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+coverage.xml
+
+# OS / editor
+.DS_Store
+.idea/
+.vscode/
