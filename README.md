@@ -7,6 +7,8 @@ Kalshi NBA game-winner markets.
   deterministically.
 * **Phase 2** — extract the executable Kalshi quote and market-implied
   probability exactly *N* minutes before each game's scheduled tipoff.
+* **Phase 3A0** — expand the NBA side to 20 seasons (2006-07 … 2025-26) and
+  audit it: season structure, franchise identity, and chronology.
 
 There is deliberately no model, no frontend, no database service, no trading
 logic, and no execution system here. The goal is a dataset you can *trust*
@@ -454,6 +456,186 @@ correctly oriented):
 Mean home midpoint **0.5519** vs actual home win rate **0.5545** — a 0.003 gap
 across 1,230 games. Brier score 0.1946 against a 0.25 always-0.5 baseline. Home
 favourites won 71.1% of their games; a mirrored orientation would show 28.9%.
+
+## Phase 3A0 — 20-season historical expansion
+
+Builds a lookahead-safe regular-season dataset for **2006-07 … 2025-26** plus the
+audits needed to trust it. No model features, no Kalshi data.
+
+```bash
+python -m nba_prediction_market.pipelines.build_history --seasons 2006-2025
+```
+
+Seasons are cached one file per season under `data/raw/nba/seasons/` and never
+refetched unless `--refresh` is passed, so a run can be interrupted and resumed.
+A cold run takes ~50 minutes on the free tier (rate-limited); re-runs are
+seconds.
+
+### Output
+
+```
+data/processed/nba_regular_season_games_2006_26.parquet   (+ .csv)  regular season only
+data/processed/nba_all_games_2006_26.parquet              (+ .csv)  every phase preserved
+data/processed/nba_team_identity_2006_26.parquet          (+ .csv)  identity audit
+data/reports/historical_nba_2006_26_report.json
+```
+
+### Not every season is 1,230 games
+
+The 30×82/2 invariant is only correct for a *standard* season. Three of the
+twenty are not, and forcing them to 1,230 would either drop real games or invent
+missing ones. Each season declares its own structure in
+`ingestion/season_metadata.py` with the reason and evidence attached:
+
+| season | structure | expected games | per team | why |
+| --- | --- | --- | --- | --- |
+| 2011-12 | shortened | 990 | 66 | lockout; season opened 25 Dec 2011 |
+| 2012-13 | interrupted | 1,229 | 82 (BOS/IND 81) | BOS v IND cancelled after the Boston Marathon bombing, never made up |
+| 2019-20 | interrupted | *no uniform total* | *non-uniform* | COVID suspension; only 22 teams resumed in the bubble |
+| 2020-21 | shortened | 1,080 | 72 | COVID-shortened schedule |
+| all 16 others | standard | 1,230 | 82 | — |
+
+For 2019-20 no uniform expectation is asserted at all, because teams genuinely
+finished on different game counts. The audit checks what *can* be checked (30
+teams, dates inside the declared window) and reports the rest rather than
+asserting a number nobody can justify.
+
+### Verified API behaviour (historical)
+
+Four findings from the 20-season ingest, each of which silently corrupted the
+data before it was handled:
+
+**1. `ist_stage` is only populated for 2025-26.** The NBA Cup existed in 2023-24
+and 2024-25 too, but those seasons return `ist_stage = null` for every game — so
+their Cup finals carried no marker and were counted toward the regular season
+(1,231 games, with the two finalists on 83). Each final is a standalone event —
+**the only game played league-wide that day** — so the date is declared per
+season and is self-validating. 2025-26, where both routes are available, is the
+cross-check that they agree.
+
+**2. `postseason` is unreliable for play-in games.** It is `True` for the 2019-20
+and 2021-22 play-in games, `False` from 2022-23 onward, and *both values within
+2020-21* (5 `True`, 1 `False`). The declared play-in window therefore takes
+**precedence over the flag**; playoffs cannot fall inside it because
+`SeasonInfo` enforces `play_in_end < playoffs_start`. Before this, 12 play-in
+games were mislabelled as playoffs.
+
+**3. `date` is the *scheduled* date, not always the played date.** For 49 games —
+32 in 2020-21, 16 in 2021-22, 1 in 2022-23 — `date` still holds the original
+schedule after a COVID postponement while `datetime` holds the actual tipoff,
+diverging by up to 116 days. Ordering by `date` produces **5 physically
+impossible cases** of a team playing twice in one day; ordering by
+`game_datetime_utc` produces none. `game_datetime_utc` is therefore the only
+valid sort key, and `tipoff_date_matches_scheduled_date` flags the 49.
+The `postponed` flag is never set (0 games league-wide) and cannot be used.
+
+**4. Four games have impossible tied "final" scores.** Games 28012 (2011-12),
+32587 (2015-16), 34714 (2016-17) and 48851 (2018-19) each report equal scores
+with `status = "Final"`. Game 28012's quarter scores are byte-identical between
+the two teams and sum to 98 against a reported 123 — internally impossible.
+These are overtime games whose stored score is an end-of-period snapshot. The
+winner is **not recoverable**, so `home_win` is null and the rows are preserved
+and reported rather than dropped or guessed.
+
+### Era gating
+
+Modern rules are never projected backwards:
+
+* **Play-In** did not exist before 2019-20. Seasons before that declare no
+  play-in window, so no game can be classified `play_in` — a mid-April 2007 game
+  is simply a regular-season game.
+* **NBA Cup** began in 2023-24. Before that `ist_stage` is always null, so
+  `nba_cup_championship` is unreachable.
+
+### Game phases
+
+`game_phase` extends the Phase 1/2 vocabulary with `other_special`:
+
+| phase | how it is identified |
+| --- | --- |
+| `other_special` | a team id outside the 30 franchises (exhibition opponent) |
+| `playoffs` | `postseason == True` |
+| `nba_cup_championship` | `ist_stage == "Championship"` |
+| `play_in` | inside the season's declared play-in window (2019-20 onward) |
+| `regular_season` | inside the season's declared regular-season window |
+| `unclassified` | undeclared season, missing date, or an unknown gap |
+
+The modelling dataset is `game_phase == 'regular_season'` only. Every other phase
+is preserved in `nba_all_games_*`.
+
+### Franchise identity — an empirical finding
+
+**BALLDONTLIE returns present-day franchise identity for every era.** Verified
+against the live API:
+
+| historical reality | what `/v1/games` returns |
+| --- | --- |
+| Seattle SuperSonics (through 2007-08) | `id=21 OKC "Oklahoma City Thunder"` |
+| Charlotte Bobcats (2004-2014) | `id=4 CHA "Charlotte Hornets"` |
+| New Orleans Hornets (through 2012-13) | `id=19 NOP "New Orleans Pelicans"` |
+| New Jersey Nets (through 2011-12) | `id=3 BKN "Brooklyn Nets"` |
+
+`/v1/teams` contains no SuperSonics, Bobcats, or New Orleans Hornets entry,
+confirming this is normalization rather than per-era records.
+
+Two consequences:
+
+1. **No relocation mapping is needed.** The source team id is already a stable
+   canonical franchise id across all 20 seasons, so Elo and other sequential
+   features carry across relocations automatically. `matching/franchises.py`
+   documents the 30 ids and their historical identities rather than building
+   redundant machinery.
+2. **Historical display names are not recoverable from this source.** A 2007-08
+   Sonics game is labelled "Oklahoma City Thunder". That is correct for franchise
+   continuity and wrong for historical presentation. Documented rather than
+   patched — inventing era-accurate names would be fabricating data.
+
+Ids outside 1-30 (defunct 1940s clubs, international exhibition opponents) are
+deliberately *not* franchises, which is what lets exhibition games be identified.
+
+### Audits in the report
+
+* **Per season** — raw games returned, counts by phase, teams, games-per-team
+  distribution, first/last regular-season date, duplicate ids, missing scores and
+  datetimes, games outside the declared window, validation status.
+* **Chronology** — timezone awareness, missing timestamps, games sharing a
+  timestamp, and the impossible case of one team appearing twice at the same
+  instant, computed for **both** `date` and `game_datetime_utc` so the report
+  shows which field can be trusted for ordering. Run before building sequential
+  features, not after.
+* **Identity** — every distinct (source id, abbreviation, full name) combination
+  observed across history, so relocations stay auditable.
+
+### Phase 3A0 run results
+
+From a live run on 2026-08-20 covering all 20 seasons:
+
+| | Count |
+| --- | --- |
+| All games ingested | 25,749 |
+| **Regular season (modelling dataset)** | **24,038** |
+| Playoffs | 1,671 |
+| Play-in | 37 |
+| NBA Cup finals | 3 |
+| Other special / **unclassified** | 0 / **0** |
+| Seasons passing their own validation | **20 / 20** |
+
+Every game id is unique, every regular-season game has both scores, all 30
+franchises appear in every season, and no id carries more than one label.
+
+Known upstream defects, all preserved and reported rather than dropped:
+
+* **4 games** with unrecoverable results (impossible tied finals) → `home_win` null.
+* **13 games** with no tipoff timestamp — 2 on 2009-01-22 and an entire slate of
+  **11 on 2022-12-02**.
+* **49 games** whose `date` predates the actual tipoff (COVID postponements).
+
+### Do not read a training window into this
+
+The point of 20 seasons is to make the history *available*, not to assert it is
+all useful. Whether 3, 5, 8, 10, 15, or all seasons help is an open question to
+be settled by chronological validation **before** the 2025-26 holdout — never by
+2025-26 performance.
 
 ## Phase 1 run results (2025-26)
 

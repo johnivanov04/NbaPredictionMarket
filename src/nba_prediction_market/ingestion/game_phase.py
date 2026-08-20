@@ -1,32 +1,50 @@
 """Explicit classification of an NBA game into its competition phase.
 
 BALLDONTLIE exposes ``postseason``, which is **not** the same thing as "is this a
-regular-season game". Two kinds of game carry ``postseason=False`` while not
-counting toward the 82-game regular season:
+regular-season game". Several kinds of game carry ``postseason=False`` while not
+counting toward a team's regular-season schedule:
 
 * **Play-In Tournament** games. There is no field marking these at all -- the
   only signal available is the calendar window between the end of the regular
-  season and the start of the playoffs, so that window is declared per season in
-  :data:`SEASON_PHASE_BOUNDARIES` rather than hard-coded at a call site.
-* The **NBA Cup Championship** game. This one *is* identifiable from the API:
+  season and the start of the playoffs, declared per season in
+  :mod:`nba_prediction_market.ingestion.season_metadata`.
+* The **NBA Cup Championship** game, which *is* identifiable from the API via
   ``ist_stage == "Championship"``. Every other NBA Cup game (group play,
-  quarterfinals, semifinals) does count toward the regular season, so only the
-  final is separated out.
+  quarterfinals, semifinals) does count toward the regular season.
+* **Exhibitions against non-NBA opponents**, identifiable because one side's
+  team id is not one of the 30 franchises.
 
-Treating ``postseason == False`` as "regular season" silently admitted both into
-the 2025-26 modelling set (1,236 games instead of 1,230).
+``postseason`` is also unreliable in the other direction: it is ``True`` for
+play-in games in 2019-20 and 2021-22, ``False`` from 2022-23 onward, and *both*
+within 2020-21. The declared play-in window therefore takes precedence over it.
 
-The declared boundaries are audited, not trusted: :func:`verify_regular_season`
-re-derives the invariant that 30 teams each play exactly 82 games, so a wrong
-date in the table below fails loudly instead of shifting the dataset.
+Treating ``postseason == False`` as "regular season" silently admitted play-in
+games into the 2025-26 modelling set (1,236 instead of 1,230).
+
+**Era awareness matters.** Play-in did not exist before 2019-20 and the NBA Cup
+did not exist before 2023-24, so those classifications are only reachable in
+seasons whose declared metadata says they applied. Modern assumptions are never
+projected onto older seasons.
+
+Declared boundaries are audited, not trusted: :func:`verify_regular_season`
+re-derives each season's expected structure from the data, so a wrong date fails
+loudly instead of shifting the dataset.
 """
 
 from __future__ import annotations
 
 import logging
-from dataclasses import dataclass
 from datetime import date
 from typing import Any, Final
+
+from nba_prediction_market.ingestion.season_metadata import (
+    NBA_TEAM_COUNT,
+    STANDARD_GAMES_PER_TEAM,
+    STANDARD_REGULAR_SEASON_GAMES,
+    SeasonInfo,
+    season_info,
+)
+from nba_prediction_market.matching.franchises import is_nba_franchise
 
 logger = logging.getLogger(__name__)
 
@@ -34,8 +52,11 @@ PHASE_REGULAR_SEASON: Final = "regular_season"
 PHASE_PLAY_IN: Final = "play_in"
 PHASE_PLAYOFFS: Final = "playoffs"
 PHASE_NBA_CUP_CHAMPIONSHIP: Final = "nba_cup_championship"
-#: Used when a season's boundaries are undeclared, or a game falls in no known
-#: window. Never a silent fallback to ``regular_season``.
+#: A positively-identified non-regular-season game that is none of the above --
+#: currently exhibitions against non-NBA opponents.
+PHASE_OTHER_SPECIAL: Final = "other_special"
+#: Used when a season's metadata is undeclared, a date is missing, or a game
+#: falls in no known window. Never a silent fallback to ``regular_season``.
 PHASE_UNCLASSIFIED: Final = "unclassified"
 
 GAME_PHASES: Final[tuple[str, ...]] = (
@@ -43,6 +64,7 @@ GAME_PHASES: Final[tuple[str, ...]] = (
     PHASE_PLAY_IN,
     PHASE_PLAYOFFS,
     PHASE_NBA_CUP_CHAMPIONSHIP,
+    PHASE_OTHER_SPECIAL,
     PHASE_UNCLASSIFIED,
 )
 
@@ -50,56 +72,25 @@ GAME_PHASES: Final[tuple[str, ...]] = (
 #: season. Group/quarterfinal/semifinal games all count and are not listed.
 IST_STAGE_CHAMPIONSHIP: Final = "Championship"
 
-#: League structure, used by the audit in :func:`verify_regular_season`.
-NBA_TEAM_COUNT: Final = 30
-REGULAR_SEASON_GAMES_PER_TEAM: Final = 82
-EXPECTED_REGULAR_SEASON_GAMES: Final = NBA_TEAM_COUNT * REGULAR_SEASON_GAMES_PER_TEAM // 2  # 1230
+# Re-exported for callers that reason about a standard season.
+REGULAR_SEASON_GAMES_PER_TEAM: Final = STANDARD_GAMES_PER_TEAM
+EXPECTED_REGULAR_SEASON_GAMES: Final = STANDARD_REGULAR_SEASON_GAMES
 
-
-@dataclass(frozen=True)
-class SeasonPhaseBoundaries:
-    """Calendar boundaries separating a season's phases.
-
-    Dates are inclusive game dates in the league's local calendar (the same
-    ``date`` both sources label games with -- no timezone shifting).
-    """
-
-    regular_season_end: date
-    play_in_start: date
-    play_in_end: date
-    playoffs_start: date
-    source: str
-
-    def __post_init__(self) -> None:
-        if not self.regular_season_end < self.play_in_start:
-            raise ValueError("play-in must start after the regular season ends")
-        if not self.play_in_start <= self.play_in_end:
-            raise ValueError("play-in window is inverted")
-        if not self.play_in_end < self.playoffs_start:
-            raise ValueError("playoffs must start after the play-in ends")
-
-
-#: Declared per season. Adding a season is a deliberate, reviewable edit; an
-#: undeclared season classifies as ``unclassified`` rather than being guessed.
-SEASON_PHASE_BOUNDARIES: Final[dict[int, SeasonPhaseBoundaries]] = {
-    2025: SeasonPhaseBoundaries(
-        regular_season_end=date(2026, 4, 12),
-        play_in_start=date(2026, 4, 14),
-        play_in_end=date(2026, 4, 17),
-        playoffs_start=date(2026, 4, 18),
-        source=(
-            "2025-26 NBA calendar: regular season ended 2026-04-12, Play-In "
-            "2026-04-14..17, playoffs opened 2026-04-18. Verified against the "
-            "ingested schedule: 1230 regular-season games (82 per team), 6 "
-            "play-in games, and the first postseason=True game on 2026-04-18."
-        ),
-    ),
-}
-
-
-def phase_boundaries(season: int) -> SeasonPhaseBoundaries | None:
-    """Declared boundaries for ``season``, or ``None`` if undeclared."""
-    return SEASON_PHASE_BOUNDARIES.get(season)
+__all__ = [
+    "EXPECTED_REGULAR_SEASON_GAMES",
+    "GAME_PHASES",
+    "IST_STAGE_CHAMPIONSHIP",
+    "NBA_TEAM_COUNT",
+    "PHASE_NBA_CUP_CHAMPIONSHIP",
+    "PHASE_OTHER_SPECIAL",
+    "PHASE_PLAYOFFS",
+    "PHASE_PLAY_IN",
+    "PHASE_REGULAR_SEASON",
+    "PHASE_UNCLASSIFIED",
+    "REGULAR_SEASON_GAMES_PER_TEAM",
+    "classify_game_phase",
+    "verify_regular_season",
+]
 
 
 def classify_game_phase(
@@ -108,49 +99,79 @@ def classify_game_phase(
     postseason: bool | None,
     ist_stage: str | None,
     season: int | None,
+    home_team_source_id: int | None = None,
+    visitor_team_source_id: int | None = None,
 ) -> str:
     """Classify one game into a :data:`GAME_PHASES` value.
 
     Priority order, most authoritative signal first:
 
-    1. ``postseason`` is the API's own playoff flag.
-    2. ``ist_stage == "Championship"`` identifies the NBA Cup final explicitly.
-    3. The declared play-in window for the season.
-    4. On or before the declared regular-season end -> regular season.
+    1. A non-NBA opponent (team id outside the 30 franchises) -> exhibition.
+    2. The season's declared play-in window, **only** for seasons that had one.
+       This deliberately outranks ``postseason``, which is inconsistent for
+       play-in games across (and even within) seasons.
+    3. ``postseason`` -- the API's own playoff flag.
+    4. ``ist_stage == "Championship"`` -- the NBA Cup final, explicitly; or the
+       season's declared Cup final date, for the seasons where the API leaves
+       ``ist_stage`` null.
+    5. On or before the declared regular-season end -> regular season.
 
     Anything else -- an undeclared season, a missing date, or a game in a gap
     between declared windows -- returns ``unclassified``. It is never assumed to
     be a regular-season game.
+
+    Team ids are optional so existing callers keep working; when omitted, the
+    exhibition check is simply skipped.
     """
+    for team_id in (home_team_source_id, visitor_team_source_id):
+        if team_id is not None and not is_nba_franchise(team_id):
+            return PHASE_OTHER_SPECIAL
+
+    info = season_info(season) if season is not None else None
+
+    # The declared play-in window outranks `postseason`, because that flag is
+    # demonstrably unreliable for play-in games: True for all of 2019-20 and
+    # 2021-22, False from 2022-23 onward, and *both* within 2020-21 (5 True,
+    # 1 False). The window is exact and verified, so it wins. Playoffs cannot
+    # fall inside it -- SeasonInfo enforces play_in_end < playoffs_start.
+    if (
+        info is not None
+        and info.has_play_in
+        and game_date is not None
+        and info.play_in_start <= game_date <= info.play_in_end
+    ):
+        return PHASE_PLAY_IN
+
     if postseason:
         return PHASE_PLAYOFFS
     if ist_stage is not None and str(ist_stage).strip() == IST_STAGE_CHAMPIONSHIP:
         return PHASE_NBA_CUP_CHAMPIONSHIP
-    if game_date is None or season is None:
+    if game_date is None or season is None or info is None:
         return PHASE_UNCLASSIFIED
-
-    boundaries = phase_boundaries(season)
-    if boundaries is None:
-        return PHASE_UNCLASSIFIED
-    if boundaries.play_in_start <= game_date <= boundaries.play_in_end:
-        return PHASE_PLAY_IN
-    if game_date <= boundaries.regular_season_end:
+    # ist_stage is only populated for 2025-26, so the Cup finals of 2023-24 and
+    # 2024-25 carry no marker. Each is a standalone event -- the only game played
+    # league-wide that day -- so a declared date identifies it unambiguously.
+    if info.nba_cup_final_date is not None and game_date == info.nba_cup_final_date:
+        return PHASE_NBA_CUP_CHAMPIONSHIP
+    if info.regular_season_start <= game_date <= info.regular_season_end:
         return PHASE_REGULAR_SEASON
     return PHASE_UNCLASSIFIED
 
 
-def verify_regular_season(
-    games: list[dict[str, Any]], season: int
-) -> dict[str, Any]:
-    """Audit games classified ``regular_season`` against the league's structure.
+def verify_regular_season(games: list[dict[str, Any]], season: int) -> dict[str, Any]:
+    """Audit games classified ``regular_season`` against the season's structure.
 
-    Re-derives "30 teams x 82 games / 2 = 1230" from the data, so a wrong date in
-    :data:`SEASON_PHASE_BOUNDARIES` surfaces as a failed invariant instead of a
-    quietly larger or smaller dataset. Returns a diagnostic dict and never
-    raises -- an in-progress season legitimately fails these counts, and the
-    caller decides what to do about it.
+    Uses the season's *declared* expectations rather than assuming 30x82/2:
+    a shortened season is checked against its own totals, and a season with no
+    uniform structure (2019-20) is checked only on what can be asserted.
+
+    Returns a diagnostic dict and never raises -- an in-progress or genuinely
+    irregular season legitimately fails these counts, and the caller decides
+    what to do about it.
     """
+    info: SeasonInfo | None = season_info(season)
     regular = [g for g in games if g.get("game_phase") == PHASE_REGULAR_SEASON]
+
     per_team: dict[str, int] = {}
     for game in regular:
         for key in ("home_team_code", "visitor_team_code"):
@@ -158,32 +179,53 @@ def verify_regular_season(
             if code:
                 per_team[code] = per_team.get(code, 0) + 1
 
-    wrong = {code: n for code, n in per_team.items() if n != REGULAR_SEASON_GAMES_PER_TEAM}
+    expected_total = info.expected_regular_season_games if info else None
+    expected_per_team = info.expected_games_per_team if info else None
+    exceptions = dict(info.known_team_game_count_exceptions) if info else {}
+
+    wrong: dict[str, int] = {}
+    if expected_per_team is not None:
+        for code, count in per_team.items():
+            allowed = exceptions.get(code, expected_per_team)
+            if count != allowed:
+                wrong[code] = count
+
     phase_counts: dict[str, int] = {}
     for game in games:
         phase = str(game.get("game_phase"))
         phase_counts[phase] = phase_counts.get(phase, 0) + 1
 
-    verified = (
-        len(regular) == EXPECTED_REGULAR_SEASON_GAMES
-        and len(per_team) == NBA_TEAM_COUNT
-        and not wrong
-    )
+    checks = {
+        "metadata_declared": info is not None,
+        "team_count_matches": len(per_team) == NBA_TEAM_COUNT,
+        "total_matches_expected": (
+            expected_total is None or len(regular) == expected_total
+        ),
+        "games_per_team_uniform": not wrong,
+    }
+    verified = all(checks.values())
+
     if not verified:
         logger.warning(
             "Regular-season invariant not satisfied for season %s: %d games "
-            "(expected %d), %d teams, %d with a game count other than %d",
-            season, len(regular), EXPECTED_REGULAR_SEASON_GAMES,
-            len(per_team), len(wrong), REGULAR_SEASON_GAMES_PER_TEAM,
+            "(expected %s), %d teams, %d with unexpected game counts",
+            season, len(regular), expected_total, len(per_team), len(wrong),
         )
+
     return {
         "season": season,
+        "structure": info.structure if info else None,
+        "unusual_reason": info.unusual_reason if info else None,
         "regular_season_games": len(regular),
-        "expected_regular_season_games": EXPECTED_REGULAR_SEASON_GAMES,
+        "expected_regular_season_games": expected_total,
         "teams": len(per_team),
-        "games_per_team_expected": REGULAR_SEASON_GAMES_PER_TEAM,
+        "games_per_team_expected": expected_per_team,
+        "games_per_team_min": min(per_team.values()) if per_team else None,
+        "games_per_team_max": max(per_team.values()) if per_team else None,
         "teams_with_unexpected_game_count": wrong,
         "phase_counts": phase_counts,
-        "boundaries_declared": phase_boundaries(season) is not None,
+        # Retained key name for the Phase 2 report's schema.
+        "boundaries_declared": info is not None,
+        "checks": checks,
         "verified": verified,
     }

@@ -151,7 +151,12 @@ def normalize_game(raw: dict[str, Any]) -> dict[str, Any]:
         # Cup final also carry it. See ingestion/game_phase.py.
         "ist_stage": ist_stage,
         "game_phase": classify_game_phase(
-            game_date=game_date, postseason=postseason, ist_stage=ist_stage, season=season
+            game_date=game_date,
+            postseason=postseason,
+            ist_stage=ist_stage,
+            season=season,
+            home_team_source_id=_to_int(home.get("id")),
+            visitor_team_source_id=_to_int(visitor.get("id")),
         ),
         "postponed": bool(raw.get("postponed")) if raw.get("postponed") is not None else None,
         "home_team_id": _to_int(home.get("id")),
