@@ -623,12 +623,80 @@ From a live run on 2026-08-20 covering all 20 seasons:
 Every game id is unique, every regular-season game has both scores, all 30
 franchises appear in every season, and no id carries more than one label.
 
-Known upstream defects, all preserved and reported rather than dropped:
+Upstream defects, all resolved in Phase 3A0.1 (see below):
 
-* **4 games** with unrecoverable results (impossible tied finals) → `home_win` null.
-* **13 games** with no tipoff timestamp — 2 on 2009-01-22 and an entire slate of
-  **11 on 2022-12-02**.
-* **49 games** whose `date` predates the actual tipoff (COVID postponements).
+* **4 games** with impossible tied finals (quadruple overtime) → corrected.
+* **13 games** with no tipoff timestamp → recovered as exact UTC instants.
+* **49 games** whose `date` predates the actual tipoff (COVID postponements) →
+  flagged; `game_datetime_utc` is the authoritative chronology.
+
+**24,038 of 24,038 regular-season rows are modelling eligible.**
+
+### Phase 3A0.1 — correction layer
+
+Seventeen records had known defects. All seventeen are now resolved against
+**ESPN**, which is independent of BALLDONTLIE. Raw files under `data/raw/` are
+never modified — corrections are declared in
+`ingestion/source_corrections.py` and applied only when building the trusted
+representation.
+
+**Two systematic defects, not random corruption:**
+
+**1. Quadruple-overtime games report an impossible tie (4 games).**
+BALLDONTLIE's schema exposes `ot1`/`ot2`/`ot3` and **no `ot4` field**. A fourth
+overtime happens only when the score is level after the third, so the stored
+total is the score through OT3 — necessarily a tie — and the deciding period is
+unrepresentable. Game 48851 shows the mechanism exactly: OT1 16-16, OT2 7-7,
+OT3 8-8, total 155-155, actual final 168-161. All four 4OT games in the range are
+affected; the **457 games with one to three overtimes are unaffected**.
+
+| game | date | matchup | source | verified final |
+| --- | --- | --- | --- | --- |
+| 28012 | 2012-03-25 | UTA at ATL | 123-123 | **ATL 139 - UTA 133** |
+| 32587 | 2015-12-18 | DET at CHI | 127-127 | **DET 147 - CHI 144** |
+| 34714 | 2017-01-29 | NYK at ATL | 130-130 | **ATL 142 - NYK 139** |
+| 48851 | 2019-03-01 | CHI at ATL | 155-155 | **CHI 168 - ATL 161** |
+
+**2. Missing tipoff timestamps (13 games).** Two on 2009-01-22 and an entire
+eleven-game slate on 2022-12-02. All recovered as exact UTC instants. For every
+one, ESPN's final score was compared against BALLDONTLIE's and matched before the
+timestamp was accepted, so a timestamp cannot be attached to the wrong game.
+
+**Guards.** Each correction declares `expects` — the date, both teams, and the
+value being replaced — checked before it applies. A mismatch raises
+`CorrectionMismatchError` rather than writing a verified value onto the wrong
+record. This is what makes the layer safe to keep as upstream data changes.
+
+**Provenance is preserved in the data**, so "what BALLDONTLIE returned" and
+"what we verified" are always distinguishable:
+
+| column | meaning |
+| --- | --- |
+| `source_game_datetime_utc` / `source_home_score` / `source_away_score` | raw source values, verbatim |
+| `game_datetime_utc` / `home_score` / `away_score` | trusted values after corrections |
+| `datetime_corrected` / `score_corrected` | whether a correction applied |
+| `chronology_precision` | `exact_datetime`, `date_only_verified`, or `missing` |
+| `modeling_eligible` / `exclusion_reason` | explicit eligibility, never an implicit `dropna` |
+
+### Chronology and rest-day policy
+
+`ingestion/chronology.py` states the rules once, before any feature is written
+against them:
+
+* **`game_datetime_utc` is the only valid sort key.** `date` is the *scheduled*
+  date and was never updated for postponed games.
+* **Rest days derive from actual played tipoffs**, so a game postponed from
+  January to May gives a long rest before the May game rather than appearing as a
+  January back-to-back.
+* **A game without an orderable timestamp cannot be sequenced** — it raises
+  rather than being skipped, because a silent gap changes every rest value after
+  it.
+* Naive datetimes are refused; a silent zone assumption would shift
+  back-to-backs.
+
+Validated across all **600 team-seasons**: zero sequencing failures, zero
+negative or zero-length rests, minimum gap 0.854 days (a legitimate
+back-to-back), maximum 145.9 days (the 2020 COVID suspension).
 
 ### Do not read a training window into this
 

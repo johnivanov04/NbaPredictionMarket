@@ -49,6 +49,11 @@ from nba_prediction_market.ingestion.season_metadata import (
     season_has_play_in,
     season_info,
 )
+from nba_prediction_market.ingestion.source_corrections import (
+    SOURCE_CORRECTIONS,
+    apply_corrections,
+    eligibility,
+)
 from nba_prediction_market.matching.franchises import (
     canonical_abbreviation_for_source_id,
     is_nba_franchise,
@@ -63,7 +68,10 @@ HISTORY_COLUMNS: list[str] = [
     "season",
     "season_label",
     "date",
+    "source_game_datetime_utc",
     "game_datetime_utc",
+    "datetime_corrected",
+    "chronology_precision",
     "tipoff_date_matches_scheduled_date",
     "home_team_source_id",
     "away_team_source_id",
@@ -73,9 +81,14 @@ HISTORY_COLUMNS: list[str] = [
     "away_team",
     "home_team_full_name",
     "away_team_full_name",
+    "source_home_score",
+    "source_away_score",
     "home_score",
     "away_score",
+    "score_corrected",
     "home_win",
+    "modeling_eligible",
+    "exclusion_reason",
     "postseason",
     "ist_stage",
     "game_phase",
@@ -142,18 +155,17 @@ def build_history_frame(raw_by_season: dict[int, list[dict[str, Any]]]) -> pd.Da
             base = normalize_game(raw)
             home_id = base["home_team_id"]
             away_id = base["visitor_team_id"]
-            rows.append(
-                {
+            row = {
                     "nba_game_id": base["source_game_id"],
                     "season": base["season"],
                     "season_label": base["season_label"],
                     "date": base["game_date"],
+                    # Raw source value, retained verbatim for auditability.
+                    "source_game_datetime_utc": base["tipoff_utc"],
                     "game_datetime_utc": base["tipoff_utc"],
-                    # False marks a game whose `date` was never updated after a
-                    # postponement; `game_datetime_utc` is the played instant.
-                    "tipoff_date_matches_scheduled_date": _tipoff_matches_date(
-                        base["tipoff_utc"], base["game_date"]
-                    ),
+                    "datetime_corrected": False,
+                    "chronology_precision": None,
+                    "tipoff_date_matches_scheduled_date": None,
                     "home_team_source_id": home_id,
                     "away_team_source_id": away_id,
                     "home_franchise_id": home_id if is_nba_franchise(home_id) else None,
@@ -164,16 +176,34 @@ def build_history_frame(raw_by_season: dict[int, list[dict[str, Any]]]) -> pd.Da
                     or canonical_abbreviation_for_source_id(away_id),
                     "home_team_full_name": base["home_team_full_name"],
                     "away_team_full_name": base["visitor_team_full_name"],
+                    "source_home_score": base["home_score"],
+                    "source_away_score": base["visitor_score"],
                     "home_score": base["home_score"],
                     "away_score": base["visitor_score"],
+                    "score_corrected": False,
                     "home_win": base["home_win"],
+                    "modeling_eligible": False,
+                    "exclusion_reason": None,
                     "postseason": base["postseason"],
                     "ist_stage": base["ist_stage"],
                     "game_phase": base["game_phase"],
                     "status": base["status"],
                     "is_final": base["is_final"],
-                }
+            }
+
+            # Corrections are applied here, never to the raw files. Guards inside
+            # apply_corrections fail loudly if the source no longer matches.
+            outcome = apply_corrections(row)
+            row["datetime_corrected"] = outcome.datetime_corrected
+            row["score_corrected"] = outcome.score_corrected
+            row["chronology_precision"] = outcome.chronology_precision
+            row["tipoff_date_matches_scheduled_date"] = _tipoff_matches_date(
+                row["game_datetime_utc"], row["date"]
             )
+            eligible, reason = eligibility(row)
+            row["modeling_eligible"] = eligible
+            row["exclusion_reason"] = reason
+            rows.append(row)
 
     frame = pd.DataFrame(rows, columns=HISTORY_COLUMNS)
     return frame.sort_values(
@@ -537,6 +567,38 @@ def build_report(
             ),
             "phases_present": sorted({str(p) for p in all_games["game_phase"].unique()}),
             "known_phases": list(GAME_PHASES),
+        },
+        "corrections": {
+            "declared": len(SOURCE_CORRECTIONS),
+            "games_corrected": len({c.nba_game_id for c in SOURCE_CORRECTIONS}),
+            "datetime_corrections_applied": int(
+                regular["datetime_corrected"].fillna(False).sum()
+            ),
+            "score_corrections_applied": int(regular["score_corrected"].fillna(False).sum()),
+            "chronology_precision": {
+                str(k): int(v)
+                for k, v in regular["chronology_precision"].value_counts().to_dict().items()
+            },
+            "detail": [c.to_dict() for c in SOURCE_CORRECTIONS],
+        },
+        "modeling_eligibility": {
+            "regular_season_rows": len(regular),
+            "eligible": int(regular["modeling_eligible"].fillna(False).sum()),
+            "ineligible": int((~regular["modeling_eligible"].fillna(False)).sum()),
+            "exclusion_reasons": {
+                str(k): int(v)
+                for k, v in regular["exclusion_reason"].value_counts().to_dict().items()
+            },
+            "ineligible_rows": [
+                {
+                    "nba_game_id": int(r["nba_game_id"]),
+                    "season": int(r["season"]),
+                    "date": str(r["date"]),
+                    "matchup": f"{r['away_team']}@{r['home_team']}",
+                    "exclusion_reason": r["exclusion_reason"],
+                }
+                for r in regular[~regular["modeling_eligible"].fillna(False)].to_dict("records")
+            ],
         },
         "cache": cache_stats,
     }

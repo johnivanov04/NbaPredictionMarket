@@ -29,11 +29,10 @@ pytestmark = pytest.mark.dataset
 # the known ones are preserved in the dataset and reported, never silently
 # dropped. See the Phase 3A0 README section.
 
-#: Games recorded with equal "final" scores -- impossible in the NBA. Each is an
-#: overtime game whose stored score is an end-of-period snapshot, so the winner
-#: is not recoverable and ``home_win`` is null.
+#: Quadruple-overtime games BALLDONTLIE truncates at OT3 (no ot4 field), so its
+#: stored total is an impossible tie. All four are corrected from ESPN.
 CORRUPT_TIE_GAME_IDS = {28012, 32587, 34714, 48851}
-#: Regular-season games with no tipoff timestamp from the API.
+#: Regular-season games the API returns with a null tipoff; all 13 corrected.
 MISSING_TIMESTAMP_COUNT = 13
 #: Games whose ``date`` still holds the original schedule after a postponement.
 TIPOFF_DIVERGENCE_COUNT = 49
@@ -218,33 +217,81 @@ def test_every_regular_season_game_has_scores(regular: pd.DataFrame) -> None:
     assert regular["away_score"].notna().all()
 
 
-def test_only_the_known_corrupt_records_lack_a_result(regular: pd.DataFrame) -> None:
-    """Impossible tied 'final' scores; the winner is not recoverable."""
-    unresolved = set(regular[regular["home_win"].isna()]["nba_game_id"])
-    assert unresolved == CORRUPT_TIE_GAME_IDS
+def test_every_game_now_has_a_resolved_result(regular: pd.DataFrame) -> None:
+    """After corrections there are no unresolved outcomes and no ties."""
+    assert regular["home_win"].notna().all()
+    assert int((regular["home_score"] == regular["away_score"]).sum()) == 0
 
-    tied = set(
-        regular[regular["home_score"] == regular["away_score"]]["nba_game_id"]
-    )
-    assert tied == CORRUPT_TIE_GAME_IDS
-    # They are preserved, not dropped.
-    assert len(regular[regular["nba_game_id"].isin(CORRUPT_TIE_GAME_IDS)]) == 4
+
+def test_the_four_overtime_games_are_corrected_with_provenance(
+    regular: pd.DataFrame,
+) -> None:
+    corrected = regular[regular["nba_game_id"].isin(CORRUPT_TIE_GAME_IDS)]
+    assert len(corrected) == 4
+    assert corrected["score_corrected"].all()
+    # Raw source values are preserved and still show the impossible tie.
+    assert (corrected["source_home_score"] == corrected["source_away_score"]).all()
+    # Trusted values resolve it.
+    assert (corrected["home_score"] != corrected["away_score"]).all()
+    assert corrected["home_win"].notna().all()
+
+
+def test_corrected_scores_match_the_verified_finals(regular: pd.DataFrame) -> None:
+    expected = {
+        28012: (133, 139),   # UTA at ATL, 4OT
+        32587: (147, 144),   # DET at CHI, 4OT
+        34714: (139, 142),   # NYK at ATL, 4OT
+        48851: (168, 161),   # CHI at ATL, 4OT
+    }
+    for game_id, (away, home) in expected.items():
+        row = regular[regular["nba_game_id"] == game_id].iloc[0]
+        assert (row["away_score"], row["home_score"]) == (away, home)
+        assert bool(row["home_win"]) is (home > away)
 
 
 def test_home_win_agrees_with_the_scores(regular: pd.DataFrame) -> None:
-    usable = regular[~regular["nba_game_id"].isin(CORRUPT_TIE_GAME_IDS)]
-    derived = usable["home_score"] > usable["away_score"]
-    assert (derived == usable["home_win"]).all()
-    assert usable["home_win"].notna().all()
+    derived = regular["home_score"] > regular["away_score"]
+    assert (derived == regular["home_win"]).all()
+
+
+def test_only_corrected_rows_are_flagged_as_corrected(regular: pd.DataFrame) -> None:
+    assert set(regular[regular["score_corrected"]]["nba_game_id"]) == CORRUPT_TIE_GAME_IDS
+    assert int(regular["datetime_corrected"].sum()) == MISSING_TIMESTAMP_COUNT
+    untouched = regular[~regular["score_corrected"]]
+    assert (untouched["home_score"] == untouched["source_home_score"]).all()
 
 
 # --- chronology ------------------------------------------------------------
 
 
-def test_timestamps_are_utc_and_missing_only_where_known(regular: pd.DataFrame) -> None:
+def test_every_game_has_an_aware_utc_timestamp_after_corrections(
+    regular: pd.DataFrame,
+) -> None:
     stamps = pd.to_datetime(regular["game_datetime_utc"], utc=True, errors="coerce")
     assert stamps.dt.tz is not None
-    assert int(stamps.isna().sum()) == MISSING_TIMESTAMP_COUNT
+    assert stamps.notna().all(), "sequential features need a timestamp on every game"
+
+
+def test_the_thirteen_recovered_timestamps_keep_their_null_source_value(
+    regular: pd.DataFrame,
+) -> None:
+    corrected = regular[regular["datetime_corrected"]]
+    assert len(corrected) == MISSING_TIMESTAMP_COUNT
+    assert corrected["source_game_datetime_utc"].isna().all()
+    assert corrected["game_datetime_utc"].notna().all()
+    assert set(corrected["chronology_precision"]) == {"exact_datetime"}
+
+
+def test_every_row_is_modeling_eligible_after_corrections(regular: pd.DataFrame) -> None:
+    assert regular["modeling_eligible"].all()
+    assert regular["exclusion_reason"].isna().all()
+    assert int(regular["modeling_eligible"].sum()) == len(regular)
+
+
+def test_chronology_precision_is_declared_for_every_row(regular: pd.DataFrame) -> None:
+    """Eligibility is decided explicitly, never by an implicit dropna."""
+    assert regular["chronology_precision"].notna().all()
+    assert set(regular["chronology_precision"]) <= {"exact_datetime", "date_only_verified"}
 
 
 def test_ordering_must_use_the_tipoff_not_the_scheduled_date(report: dict) -> None:
