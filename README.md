@@ -12,6 +12,8 @@ Kalshi NBA game-winner markets.
 * **Phase 3A1** — lookahead-safe sequential features, forecasting baselines
   (constant, Elo, logistic), history-window selection, and a single 2025-26
   holdout evaluation against the Kalshi benchmark.
+* **Phase 3A2** — improved team-strength representation: margin-of-victory Elo,
+  opponent-adjusted margin, and a predetermined feature-bundle ablation.
 
 There is deliberately no model, no frontend, no database service, no trading
 logic, and no execution system here. The goal is a dataset you can *trust*
@@ -777,6 +779,73 @@ favours the model):
 | logistic − Elo | −0.00254 | [−0.0055, +0.0004] | inconclusive |
 
 Kalshi is a **benchmark only** and never enters a model matrix.
+
+## Phase 3A2 — team strength
+
+```bash
+python -m nba_prediction_market.pipelines.build_team_strength
+```
+
+Extends Phase 3A1 without touching it: separate feature table, prediction table
+(`nba_predictions_3a2_2025_26.parquet`) and report
+(`model_team_strength_2025_26.json`). The Phase 3A1 model is refit as an exact
+control so both are judged on identical games.
+
+### What was tested, and what actually helped
+
+| experiment | outcome |
+| --- | --- |
+| Home-court grid extended to 0 | **HCA = 40 confirmed a true interior optimum** (0 → 0.2223, 20 → 0.2201, 40 → 0.2193, 60 → 0.2199). Phase 3A1's boundary result was a false alarm. |
+| Margin-of-victory Elo | **Helped.** `sqrt` multiplier, dev Brier 0.21765 vs 0.21926 binary. |
+| Opponent-adjusted margin + SOS | **Did not help** (bundle C worse than B). |
+| Points scored/allowed, league-relative | **Did not help** (bundle D worst of all). |
+| Home/away venue splits | **Did not help.** |
+| Schedule fatigue | **Did not help.** |
+| Blending | **Did not help** — weight 0 optimal against all three partners. |
+
+Bundle ablation (fixed logistic, mean development Brier):
+
+| bundle | features | Brier | AUC |
+| --- | --- | --- | --- |
+| A (3A1 control) | 11 | 0.21635 | 0.7019 |
+| **B (+ MOV Elo)** | **12** | **0.21609** | **0.7027** |
+| C (+ adjusted margin, SOS) | 16 | 0.21621 | 0.7021 |
+| D (+ scoring) | 27 | 0.21634 | 0.7016 |
+| E (+ venue splits) | 29 | 0.21621 | 0.7020 |
+| F (+ fatigue) | 36 | 0.21623 | 0.7018 |
+
+**Only one of five new feature families earned its place.** Bundle B — one extra
+feature — is frozen.
+
+### Frozen Phase 3A2 configuration
+
+| | |
+| --- | --- |
+| Elo (feature) | K=20, HCA=40, regression=0.50, all_available |
+| MOV Elo | K=20, HCA=40, regression=0.50, `sqrt`, all_available |
+| Bundle | B (12 features) |
+| Logistic | 5-season window, C=1.0 |
+| Blend | none |
+
+### 2025-26 (secondary benchmark)
+
+| model | Brier | log loss | acc | AUC | ECE |
+| --- | --- | --- | --- | --- | --- |
+| Phase 3A1 logistic | 0.20575 | 0.59834 | 0.6797 | 0.7362 | 0.020 |
+| **Phase 3A2 logistic** | **0.20451** | **0.59552** | **0.6927** | **0.7396** | 0.034 |
+| MOV Elo alone | 0.20440 | 0.59564 | 0.6927 | 0.7400 | 0.040 |
+| Kalshi normalized | 0.19465 | 0.57013 | 0.6911 | 0.7650 | 0.034 |
+
+Paired bootstrap (10,000 resamples, fixed seed; negative favours the model):
+
+| comparison | ΔBrier | 95% CI | verdict |
+| --- | --- | --- | --- |
+| 3A2 − 3A1 | −0.00124 | [−0.0022, −0.0003] | **3A2 better** |
+| 3A2 − Kalshi | +0.00986 | [+0.0048, +0.0149] | market better |
+| 3A1 − Kalshi | +0.01109 | [+0.0058, +0.0164] | market better |
+
+The improvement over Phase 3A1 is real but small; the gap to the market narrowed
+from 0.0111 to 0.0099 and remains clearly significant.
 
 ### Do not read a training window into this
 

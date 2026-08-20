@@ -116,13 +116,21 @@ def recency_weights(
     return np.power(0.5, age / float(half_life))
 
 
-def feature_matrix(frame: pd.DataFrame) -> pd.DataFrame:
-    """The allowlisted feature columns, validated."""
-    missing = [c for c in MODEL_FEATURES if c not in frame.columns]
+def feature_matrix(
+    frame: pd.DataFrame, features: Sequence[str] | None = None
+) -> pd.DataFrame:
+    """The allowlisted feature columns, validated.
+
+    ``features`` lets a caller supply its own allowlist (Phase 3A2 bundles);
+    omitting it uses the Phase 3A1 frozen set and applies the stricter validator.
+    """
+    allowlist = list(features) if features is not None else list(MODEL_FEATURES)
+    missing = [c for c in allowlist if c not in frame.columns]
     if missing:
         raise ValueError(f"feature frame is missing required columns: {missing}")
-    matrix = frame.loc[:, list(MODEL_FEATURES)].astype(float)
-    validate_feature_matrix(list(matrix.columns))
+    matrix = frame.loc[:, allowlist].astype(float)
+    if features is None:
+        validate_feature_matrix(list(matrix.columns))
     return matrix
 
 
@@ -134,18 +142,21 @@ class FittedLogistic:
     config: LogisticConfig
     training_seasons: list[int]
     n_training_rows: int
+    features: tuple[str, ...] | None = None
 
     def predict_proba(self, frame: pd.DataFrame) -> np.ndarray:
-        return self.pipeline.predict_proba(feature_matrix(frame))[:, 1]
+        return self.pipeline.predict_proba(feature_matrix(frame, self.features))[:, 1]
 
 
 def fit_logistic(
-    training: pd.DataFrame, config: LogisticConfig
+    training: pd.DataFrame,
+    config: LogisticConfig,
+    features: Sequence[str] | None = None,
 ) -> FittedLogistic:
     """Fit the pipeline on ``training`` only, applying recency weights if configured."""
     if training.empty:
         raise ValueError("no training rows supplied")
-    x = feature_matrix(training)
+    x = feature_matrix(training, features)
     y = training[TARGET].astype(int).to_numpy()
 
     fit_params: dict[str, Any] = {}
@@ -164,4 +175,5 @@ def fit_logistic(
         config=config,
         training_seasons=sorted(training["season"].unique().tolist()),
         n_training_rows=len(training),
+        features=tuple(features) if features is not None else None,
     )
