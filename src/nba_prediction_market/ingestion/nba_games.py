@@ -9,6 +9,11 @@ from typing import Any
 import pandas as pd
 
 from nba_prediction_market.config import season_label
+from nba_prediction_market.ingestion.game_phase import (
+    PHASE_UNCLASSIFIED,
+    classify_game_phase,
+    verify_regular_season,
+)
 from nba_prediction_market.matching.team_names import resolve_team
 
 logger = logging.getLogger(__name__)
@@ -28,6 +33,8 @@ NBA_GAME_COLUMNS: list[str] = [
     "is_final",
     "period",
     "postseason",
+    "ist_stage",
+    "game_phase",
     "postponed",
     "home_team_id",
     "home_team_abbreviation",
@@ -122,6 +129,8 @@ def normalize_game(raw: dict[str, Any]) -> dict[str, Any]:
 
     game_date = _parse_date(raw.get("date"))
     season = _to_int(raw.get("season"))
+    postseason = bool(raw.get("postseason")) if raw.get("postseason") is not None else None
+    ist_stage = raw.get("ist_stage")
     matchup_key: str | None = None
     if game_date and home_code and visitor_code:
         matchup_key = f"{game_date.isoformat()}|{'|'.join(sorted((home_code, visitor_code)))}"
@@ -137,7 +146,13 @@ def normalize_game(raw: dict[str, Any]) -> dict[str, Any]:
         "status_state": status_state,
         "is_final": is_final,
         "period": _to_int(raw.get("period")),
-        "postseason": bool(raw.get("postseason")) if raw.get("postseason") is not None else None,
+        "postseason": postseason,
+        # postseason=False does NOT mean regular season -- play-in and the NBA
+        # Cup final also carry it. See ingestion/game_phase.py.
+        "ist_stage": ist_stage,
+        "game_phase": classify_game_phase(
+            game_date=game_date, postseason=postseason, ist_stage=ist_stage, season=season
+        ),
         "postponed": bool(raw.get("postponed")) if raw.get("postponed") is not None else None,
         "home_team_id": _to_int(home.get("id")),
         "home_team_abbreviation": home.get("abbreviation"),
@@ -222,6 +237,23 @@ def build_games_frame(raw_games: list[dict[str, Any]], season: int) -> pd.DataFr
         )
 
     verify_season(normalized, season)
+
+    audit = verify_regular_season(normalized, season)
+    logger.info("Game phases for season %s: %s", season, audit["phase_counts"])
+    if not audit["boundaries_declared"]:
+        logger.warning(
+            "No phase boundaries declared for season %s; play-in games cannot be "
+            "distinguished and are marked %r. Add an entry to "
+            "SEASON_PHASE_BOUNDARIES in ingestion/game_phase.py.",
+            season, PHASE_UNCLASSIFIED,
+        )
+    elif not audit["verified"]:
+        logger.warning(
+            "Regular-season invariant failed for season %s: %d games across %d teams "
+            "(expected %d / %d). Check SEASON_PHASE_BOUNDARIES.",
+            season, audit["regular_season_games"], audit["teams"],
+            audit["expected_regular_season_games"], audit["games_per_team_expected"],
+        )
 
     frame = pd.DataFrame(normalized, columns=NBA_GAME_COLUMNS)
     before = len(frame)

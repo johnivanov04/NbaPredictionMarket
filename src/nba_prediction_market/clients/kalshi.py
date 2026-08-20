@@ -16,8 +16,10 @@ import httpx
 
 from nba_prediction_market.clients.base import BaseApiClient
 from nba_prediction_market.config import (
+    DEFAULT_CANDLE_PERIOD_INTERVAL,
     DEFAULT_KALSHI_MIN_INTERVAL,
     KALSHI_BASE_URL,
+    KALSHI_CANDLE_PERIOD_INTERVALS,
     KALSHI_EVENTS_LIMIT,
     KALSHI_MARKETS_LIMIT,
     KALSHI_NBA_SERIES_TICKER,
@@ -27,6 +29,11 @@ logger = logging.getLogger(__name__)
 
 SOURCE_HISTORICAL = "historical"
 SOURCE_MARKETS = "markets"
+
+#: Which candlestick endpoint served a pull. The two return the *same* data
+#: under *different* field names, so this has to travel with the payload.
+CANDLES_HISTORICAL = "historical_candlesticks"
+CANDLES_SERIES = "series_candlesticks"
 
 
 def _cursor(payload: dict[str, Any]) -> Any:
@@ -167,3 +174,62 @@ class KalshiClient(BaseApiClient):
         for page in self.iter_events(series_ticker):
             events.extend(page)
         return events
+
+
+    # --- Phase 2: candlesticks ---------------------------------------------
+
+    def get_historical_candlesticks(
+        self,
+        market_ticker: str,
+        *,
+        start_ts: int,
+        end_ts: int,
+        period_interval: int = DEFAULT_CANDLE_PERIOD_INTERVAL,
+    ) -> dict[str, Any]:
+        """``GET /historical/markets/{ticker}/candlesticks`` for archived markets.
+
+        Returns the payload verbatim. Field names here are the *bare* forms
+        (``volume``, ``price.close``); the series endpoint uses suffixed ones.
+        """
+        return self._candlesticks(
+            f"/historical/markets/{market_ticker}/candlesticks",
+            start_ts=start_ts,
+            end_ts=end_ts,
+            period_interval=period_interval,
+        )
+
+    def get_series_candlesticks(
+        self,
+        market_ticker: str,
+        *,
+        series_ticker: str = KALSHI_NBA_SERIES_TICKER,
+        start_ts: int,
+        end_ts: int,
+        period_interval: int = DEFAULT_CANDLE_PERIOD_INTERVAL,
+    ) -> dict[str, Any]:
+        """``GET /series/{series}/markets/{ticker}/candlesticks`` for current markets.
+
+        Same data as the historical endpoint, but every value is suffixed
+        (``volume_fp``, ``price.close_dollars``).
+        """
+        return self._candlesticks(
+            f"/series/{series_ticker}/markets/{market_ticker}/candlesticks",
+            start_ts=start_ts,
+            end_ts=end_ts,
+            period_interval=period_interval,
+        )
+
+    def _candlesticks(
+        self, path: str, *, start_ts: int, end_ts: int, period_interval: int
+    ) -> dict[str, Any]:
+        if period_interval not in KALSHI_CANDLE_PERIOD_INTERVALS:
+            raise ValueError(
+                f"period_interval must be one of {sorted(KALSHI_CANDLE_PERIOD_INTERVALS)}, "
+                f"got {period_interval} (Kalshi rejects other values with HTTP 400)"
+            )
+        if end_ts < start_ts:
+            raise ValueError(f"end_ts {end_ts} precedes start_ts {start_ts}")
+        return self.get_json(
+            path,
+            {"start_ts": start_ts, "end_ts": end_ts, "period_interval": period_interval},
+        )

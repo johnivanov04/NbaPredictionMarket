@@ -7,6 +7,12 @@ from datetime import UTC, date, datetime
 import pytest
 from tests.conftest import bdl_game
 
+from nba_prediction_market.ingestion.game_phase import (
+    PHASE_NBA_CUP_CHAMPIONSHIP,
+    PHASE_PLAY_IN,
+    PHASE_PLAYOFFS,
+    PHASE_REGULAR_SEASON,
+)
 from nba_prediction_market.ingestion.nba_games import (
     NBA_GAME_COLUMNS,
     SeasonVerificationError,
@@ -190,3 +196,58 @@ def test_verify_season_rejects_a_schedule_that_does_not_start_in_autumn() -> Non
 def test_verify_season_rejects_an_empty_pull() -> None:
     with pytest.raises(SeasonVerificationError, match="No parseable game dates"):
         verify_season([], 2025)
+
+
+# --- game phase on normalized games ---------------------------------------
+
+
+def test_normalized_game_carries_an_explicit_phase() -> None:
+    row = normalize_game(bdl_game())
+    assert row["game_phase"] == PHASE_REGULAR_SEASON
+    assert row["ist_stage"] is None
+
+
+def test_play_in_games_are_not_labelled_regular_season() -> None:
+    """The 2026 play-in games carry postseason=False and no ist_stage."""
+    row = normalize_game(bdl_game(id=21681576, date="2026-04-14", postseason=False))
+    assert row["postseason"] is False
+    assert row["game_phase"] == PHASE_PLAY_IN
+
+
+def test_last_regular_season_day_is_still_regular_season() -> None:
+    row = normalize_game(bdl_game(date="2026-04-12"))
+    assert row["game_phase"] == PHASE_REGULAR_SEASON
+
+
+def test_playoff_games_are_labelled_playoffs() -> None:
+    row = normalize_game(bdl_game(date="2026-04-18", postseason=True))
+    assert row["game_phase"] == PHASE_PLAYOFFS
+
+
+def test_nba_cup_final_is_labelled_and_kept() -> None:
+    row = normalize_game(bdl_game(date="2025-12-16", ist_stage="Championship"))
+    assert row["ist_stage"] == "Championship"
+    assert row["game_phase"] == PHASE_NBA_CUP_CHAMPIONSHIP
+    assert row["postseason"] is False
+
+
+def test_nba_cup_group_games_stay_regular_season() -> None:
+    row = normalize_game(bdl_game(date="2025-11-28", ist_stage="East Group A"))
+    assert row["game_phase"] == PHASE_REGULAR_SEASON
+
+
+def test_all_phases_survive_into_the_frame() -> None:
+    """Play-in and the cup final are preserved, never dropped."""
+    games = [
+        bdl_game(id=1, date="2025-10-21"),
+        bdl_game(id=2, date="2025-12-16", ist_stage="Championship"),
+        bdl_game(id=3, date="2026-04-14"),
+        bdl_game(id=4, date="2026-04-18", postseason=True),
+    ]
+    frame = build_games_frame(games, 2025)
+
+    assert len(frame) == 4
+    assert list(frame["game_phase"]) == [
+        PHASE_REGULAR_SEASON, PHASE_NBA_CUP_CHAMPIONSHIP, PHASE_PLAY_IN, PHASE_PLAYOFFS
+    ]
+    assert "ist_stage" in frame.columns

@@ -33,9 +33,10 @@ where = ["src"]
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 markers = [
-    "integration: hits live APIs; deselected by default via -m 'not integration'",
+    "integration: hits live APIs; deselected by default",
+    "dataset: asserts invariants of the generated data/ artefacts; deselected by default",
 ]
-addopts = "-m 'not integration'"
+addopts = "-m 'not integration and not dataset'"
 
 [tool.coverage.run]
 source = ["nba_prediction_market"]

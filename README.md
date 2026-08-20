@@ -1,11 +1,16 @@
-# NbaPredictionMarket — Phase 1: Historical Data Foundation
+# NbaPredictionMarket — Historical Data Foundation
 
-A reproducible, auditable ingestion layer for NBA game results and Kalshi NBA
-game-winner market metadata, plus a deterministic join between the two.
+A reproducible, auditable research dataset built from NBA game results and
+Kalshi NBA game-winner markets.
 
-**Phase 1 scope only.** There is deliberately no model, no frontend, no
-database service, no trading logic, and no execution system here. The goal is a
-dataset you can *trust* before anything is built on top of it.
+* **Phase 1** — ingest both sources, normalize them, and join them
+  deterministically.
+* **Phase 2** — extract the executable Kalshi quote and market-implied
+  probability exactly *N* minutes before each game's scheduled tipoff.
+
+There is deliberately no model, no frontend, no database service, no trading
+logic, and no execution system here. The goal is a dataset you can *trust*
+before anything is built on top of it.
 
 ## What it does
 
@@ -200,11 +205,16 @@ responses. They cover pagination, retry/rate-limit behaviour, team
 normalization, matching (including ambiguity and determinism), duplicate
 handling, and the pipeline end to end.
 
-Live smoke tests are marked `integration` and deselected by default:
+Two suites are deselected by default:
 
 ```bash
 pytest -m integration   # hits the real APIs; needs BALLDONTLIE_API_KEY
+pytest -m dataset       # asserts invariants of the generated data/ artefacts
 ```
+
+`-m dataset` is the one to run after regenerating: it pins the regular season at
+1,230 games with 82 per team, and asserts that no play-in or NBA Cup final game
+entered the primary Phase 2 dataset.
 
 They assert the *shape* of the responses, so an upstream schema change gets
 caught rather than silently corrupting a dataset.
@@ -238,6 +248,212 @@ the code is built around:
   coverage), with the structured event ticker as fallback.
 * The `KXNBAGAME` archive spans **multiple seasons** and is not season-filterable
   server-side, so markets are scoped client-side to the season window.
+
+**Kalshi candlesticks (Phase 2)**
+
+* **The two candlestick endpoints return the same data under different field
+  names.** `/historical/markets/{ticker}/candlesticks` uses bare names
+  (`volume`, `open_interest`, `price.close`, `yes_bid.close`); the live
+  `/series/{s}/markets/{ticker}/candlesticks` suffixes every one
+  (`volume_fp`, `open_interest_fp`, `price.close_dollars`,
+  `yes_bid.close_dollars`). Parsing accepts both, so routing between tiers
+  cannot silently produce null columns. An integration test guards each.
+* **`price.close` is `null` whenever no trade occurred in that minute**, while
+  `yes_bid` / `yes_ask` stay fully populated and `price.previous` still carries
+  the last traded price. This happened on ~5% of selected candles. It is the
+  concrete reason bid/ask must be preserved separately from trade price, and why
+  `last_trade_price` cannot serve as an entry price.
+* Prices arrive as **decimal-dollar strings already in `[0, 1]`** (`"0.6500"`),
+  not cents. Nothing is rescaled; values outside `[0, 1]` are rejected rather
+  than clamped.
+* The window is **inclusive of both bounds** — a 60-minute request returns 61
+  one-minute candles.
+* `period_interval` must be one of `{1, 60, 1440}`; anything else is a HTTP 400.
+  The client validates before sending.
+* An unknown ticker returns **404**, which is what drives the archive-to-live
+  fallback.
+* Candlesticks need **no authentication**.
+
+## Phase 2 — pregame quotes at T-minus-30
+
+Answers one question per game: **what were the executable Kalshi quotes and the
+market-implied probability exactly 30 minutes before scheduled tipoff?**
+
+```bash
+python -m nba_prediction_market.pipelines.build_pregame_quotes \
+    --season 2025 --minutes-before-tip 30 --max-quote-age-minutes 10
+```
+
+Requires the Phase 1 outputs to exist; it fails with an actionable message if
+they do not. A cold run takes ~20 minutes (2,472 rate-limited requests); re-runs
+are ~3 seconds because every response is cached.
+
+### Options
+
+| Flag | Default | Purpose |
+| --- | --- | --- |
+| `--season` | `2025` | Season start year |
+| `--minutes-before-tip` | `30` | Anchor offset before tipoff |
+| `--max-quote-age-minutes` | `10` | Staleness limit for a usable quote |
+| `--lookback-minutes` | `60` | Candle window length |
+| `--period-interval` | `1` | Candle granularity (minutes) |
+| `--refresh` | off | Ignore cached responses and refetch |
+| `--limit` | none | Process only the first N games (smoke runs) |
+| `--no-csv` | off | Parquet only |
+
+### Scope
+
+The primary dataset covers **matched games whose `game_phase` is
+`regular_season`** — 1,230 games for 2025-26.
+
+Selection is on the explicit phase label, **not** on `postseason == False`. Two
+kinds of game carry `postseason = False` without being regular-season games:
+
+* the **six Play-In games** (2026-04-14 … 04-17), and
+* the **NBA Cup Championship** (SAS at NYK, 2025-12-16).
+
+Filtering on `postseason == False` admitted all of these and produced 1,236
+eligible games instead of 1,230. See "Game phases" below.
+
+Every phase is preserved in Phase 1's tables — nothing is deleted, and Play-In
+games can be modelled later by selecting `game_phase == 'play_in'`.
+
+### Game phases
+
+`nba_games_*` and `nba_kalshi_matches_*` carry an explicit `game_phase` column
+(`ingestion/game_phase.py`), one of:
+
+| phase | 2025-26 count | how it is identified |
+| --- | --- | --- |
+| `regular_season` | 1,230 | everything not below (82 per team × 30 ÷ 2) |
+| `play_in` | 6 | falls in the declared Play-In window |
+| `playoffs` | 85 | BALLDONTLIE `postseason == True` |
+| `nba_cup_championship` | 1 | BALLDONTLIE `ist_stage == "Championship"` |
+| `unclassified` | 0 | undeclared season, missing date, or an unknown gap |
+
+The playoff flag and the NBA Cup final come straight from API fields. **The
+Play-In has no field at all** — BALLDONTLIE marks those games
+`postseason = False` with `ist_stage = None`, indistinguishable from a regular
+game except by date. That forces a season-specific calendar boundary, which is
+declared once in `SEASON_PHASE_BOUNDARIES` with its provenance:
+
+```python
+2025: SeasonPhaseBoundaries(
+    regular_season_end=date(2026, 4, 12),
+    play_in_start=date(2026, 4, 14),
+    play_in_end=date(2026, 4, 17),
+    playoffs_start=date(2026, 4, 18),
+)
+```
+
+Two safeguards keep that from being a magic number:
+
+1. **An undeclared season is never guessed.** It classifies as `unclassified`,
+   and Phase 2 then selects zero games rather than silently treating Play-In
+   games as regular season.
+2. **The declared dates are audited, not trusted.** `verify_regular_season`
+   re-derives the league invariant — 30 teams, 82 games each, 1,230 total — from
+   the classified data. A wrong boundary date breaks the invariant and is
+   reported in `pregame_t30_report.json` under `phase_selection`. Note the
+   NBA Cup *group, quarterfinal, and semifinal* games do count toward the 82;
+   only the final does not.
+
+Also note: `ist_stage` distinguishes NBA Cup games generally, so the Cup's
+knockout rounds can be separated later if wanted — they are currently counted as
+regular season, which is correct for standings.
+
+### Output
+
+```
+data/processed/nba_kalshi_pregame_t30_2025_26.parquet   (+ .csv)
+data/reports/pregame_t30_report.json
+data/raw/kalshi/candlesticks/t30_lb60_p1/<game date>/<market ticker>.json
+```
+
+**One row per NBA game**, not per Kalshi market. 50 columns: the NBA game and
+its outcome, the anchor (`prediction_ts_utc`), match provenance, then a full
+`home_*` and `away_*` quote block (bid, ask, midpoint, spread, last and previous
+trade price, volume, open interest, quote timestamp, age, usability, issue
+code), then quality fields.
+
+### How the quote is chosen
+
+For each of the two team markets:
+
+1. `prediction_ts_utc = game_datetime_utc - minutes_before_tip`. **The NBA
+   tipoff is the source of truth** — Kalshi close/settlement times are never
+   used as the anchor.
+2. Fetch 1-minute candles for `[prediction_ts - 60min, prediction_ts]`.
+3. Discard every candle with `end_period_ts > prediction_ts`. This is the single
+   chokepoint that prevents lookahead, and it is applied before anything else.
+4. Take the most recent remaining candle that actually carries a quote. Values
+   are never forward-filled from a later candle.
+5. `quote_age_seconds = prediction_ts - candle end_period_ts`, always recorded —
+   even for unusable quotes, so staleness is measurable rather than invisible.
+6. A quote older than `--max-quote-age-minutes` is **kept for diagnostics but
+   marked unusable**. Age exactly equal to the limit is still usable.
+
+`quote_usable` requires a fresh quote *and* both sides present, because the
+midpoint is the stated probability benchmark and is only defined two-sided.
+`midpoint` and `spread` are computed **only** when both bid and ask exist, and
+are never synthesised from trade prices.
+
+### Price semantics — read before modelling
+
+* **`market_midpoint`** — `(bid + ask) / 2`. The market probability benchmark.
+* **`yes_ask`** — approximate immediate price to *buy* YES.
+* **`yes_bid`** — approximate immediate price to *sell* YES.
+* **`last_trade_price` is NOT an executable entry price.** It is whatever last
+  traded in that minute, and it is **null in ~5% of rows** because no trade
+  occurred (see "Verified API behaviour"). Using it as an entry price would be
+  both unfillable and biased toward liquid games.
+
+`market_midpoint_sum` is deliberately **not** normalised to 1. The observed
+deviation is data worth looking at, not noise to be scaled away.
+
+## Phase 2 run results (2025-26)
+
+From a live run on 2026-08-19 at T-30 minutes:
+
+| | Value |
+| --- | --- |
+| Eligible games (matched, regular season) | 1,230 |
+| **Both sides usable** | **1,230 (100.0%)** |
+| Home-only / away-only / neither usable | 0 / 0 / 0 |
+| Missing, stale, malformed, failed quotes | 0 |
+| Candles selected after the anchor | **0** |
+
+**Quote age:** 2,445 of 2,460 quotes are 0 seconds old (a candle lands exactly
+on the anchor); 11 are 60s, 4 are 120s. Max 120s against a 600s limit — nothing
+came close to stale.
+
+**Spread:** 1 cent on 2,306 quotes, 2 cents on 154. No crossed or zero-width
+books.
+
+**Midpoint sum:** min 0.980, max 1.020, exactly 1.000 on 754 of 1,230 games.
+Deviation from 1 exceeds 0.01 on 15 games (1.2%), exceeds 0.02 on **0**. The
+spread is 1-2 cents on each side, so a 1-2 cent deviation is the expected
+granularity artefact rather than a data problem.
+
+**Calibration** (the strongest end-to-end check that the data is correct and
+correctly oriented):
+
+| home midpoint bucket | n | mean midpoint | actual home win rate |
+| --- | --- | --- | --- |
+| 0.0-0.1 | 24 | 0.076 | 0.000 |
+| 0.1-0.2 | 71 | 0.156 | 0.127 |
+| 0.2-0.3 | 97 | 0.249 | 0.258 |
+| 0.3-0.4 | 149 | 0.353 | 0.356 |
+| 0.4-0.5 | 170 | 0.448 | 0.494 |
+| 0.5-0.6 | 160 | 0.553 | 0.519 |
+| 0.6-0.7 | 187 | 0.651 | 0.679 |
+| 0.7-0.8 | 170 | 0.750 | 0.771 |
+| 0.8-0.9 | 159 | 0.850 | 0.805 |
+| 0.9-1.0 | 43 | 0.928 | 0.977 |
+
+Mean home midpoint **0.5519** vs actual home win rate **0.5545** — a 0.003 gap
+across 1,230 games. Brier score 0.1946 against a 0.25 always-0.5 baseline. Home
+favourites won 71.1% of their games; a mirrored orientation would show 28.9%.
 
 ## Phase 1 run results (2025-26)
 
@@ -309,6 +525,29 @@ Every unmatched record has an identified cause:
   tier (12.5s). A paid tier can go much faster via
   `BALLDONTLIE_MIN_INTERVAL_SECONDS`.
 
+**Phase 2**
+
+* **`quote_usable` bundles two conditions** — fresh enough *and* two-sided. The
+  granular reason is always in `quote_issue`, so the two can be separated if you
+  later want a one-sided quote to count as usable.
+* **Derived prices are rounded to 6dp.** Kalshi quotes whole cents, so midpoints
+  land on half-cents; left unrounded, `abs(0.99 - 1.0)` evaluates to
+  `0.010000000000000009` and compares greater than 0.01, which inflated the
+  deviation-threshold counts. 6dp is lossless for every real value.
+* **Candle fetching is sequential**, not concurrent. A cold run is ~20 minutes;
+  the cache makes every re-run ~3 seconds. Determinism and a trivially resumable
+  run were worth more than the wall-clock saving.
+* **The cache is keyed by request geometry.** Changing `--minutes-before-tip`,
+  `--lookback-minutes`, or `--period-interval` writes to a different directory,
+  so windows can never be mixed; changing them does mean refetching.
+* **One game had a two-sided ask sum below $1.00** (0.99), a theoretical
+  1-cent lock before fees. One occurrence in 1,236 games is a market artefact,
+  not a data error, but it is worth knowing the data contains such rows.
+* **`--minutes-before-tip` uses the *scheduled* tipoff.** If a game's actual
+  start slipped, the anchor still refers to the schedule. BALLDONTLIE's
+  `datetime` is the only start time available, and it is not marked as
+  scheduled-vs-actual.
+
 ## Layout
 
 ```
@@ -320,7 +559,10 @@ src/nba_prediction_market/
   ingestion/raw_store.py        verbatim raw-payload persistence
   ingestion/nba_games.py        game normalization + season verification
   ingestion/kalshi_markets.py   market normalization + field derivation
+  ingestion/candlesticks.py     candle parsing + lookahead-safe quote selection
+  ingestion/candle_cache.py     resumable per-market raw response cache
   matching/team_names.py        30 franchises, exact aliases, no fuzzy matching
   matching/game_market_matcher.py   deterministic join + classification
-  pipelines/build_dataset.py    CLI entry point
+  pipelines/build_dataset.py         Phase 1 CLI entry point
+  pipelines/build_pregame_quotes.py  Phase 2 CLI entry point
 ```

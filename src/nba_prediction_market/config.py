@@ -30,6 +30,19 @@ BALLDONTLIE_PER_PAGE: Final = 100
 KALSHI_MARKETS_LIMIT: Final = 1000
 KALSHI_EVENTS_LIMIT: Final = 200
 
+# --- Phase 2: pregame quote extraction ------------------------------------
+
+#: Minutes before scheduled tipoff that the quote snapshot is anchored to.
+DEFAULT_MINUTES_BEFORE_TIP: Final = 30
+#: How far back the candlestick window reaches from the prediction timestamp.
+DEFAULT_QUOTE_LOOKBACK_MINUTES: Final = 60
+#: A selected quote older than this is preserved but flagged unusable.
+DEFAULT_MAX_QUOTE_AGE_MINUTES: Final = 10
+#: Candle granularity. Kalshi rejects anything outside its allowed set with a 400.
+DEFAULT_CANDLE_PERIOD_INTERVAL: Final = 1
+#: Values the candlestick endpoints accept for ``period_interval`` (minutes).
+KALSHI_CANDLE_PERIOD_INTERVALS: Final = frozenset({1, 60, 1440})
+
 
 class ConfigError(RuntimeError):
     """Raised when required configuration is missing or invalid."""
