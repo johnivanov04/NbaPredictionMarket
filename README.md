@@ -9,6 +9,9 @@ Kalshi NBA game-winner markets.
   probability exactly *N* minutes before each game's scheduled tipoff.
 * **Phase 3A0** — expand the NBA side to 20 seasons (2006-07 … 2025-26) and
   audit it: season structure, franchise identity, and chronology.
+* **Phase 3A1** — lookahead-safe sequential features, forecasting baselines
+  (constant, Elo, logistic), history-window selection, and a single 2025-26
+  holdout evaluation against the Kalshi benchmark.
 
 There is deliberately no model, no frontend, no database service, no trading
 logic, and no execution system here. The goal is a dataset you can *trust*
@@ -697,6 +700,83 @@ against them:
 Validated across all **600 team-seasons**: zero sequencing failures, zero
 negative or zero-length rests, minimum gap 0.854 days (a legitimate
 back-to-back), maximum 145.9 days (the 2020 COVID suspension).
+
+## Phase 3A1 — forecasting baselines
+
+```bash
+python -m nba_prediction_market.pipelines.build_baselines
+```
+
+Outputs `nba_model_features_2006_26.parquet` (24,038 rows),
+`nba_predictions_2025_26.parquet` (1,230 rows), and
+`data/reports/model_baselines_2025_26.json`.
+
+### Research split
+
+2025-26 is the **holdout**, evaluated exactly once after every choice is frozen.
+Development validation uses 2021-22 … 2024-25; for each validation season the
+model trains only on strictly earlier seasons.
+
+Two things are carefully distinguished:
+
+* **Sequential state may use earlier games of the same season.** A February 2026
+  prediction can use January 2026 results, because they existed at prediction
+  time.
+* **Model parameters may not.** Coefficients and hyperparameters are frozen
+  before the holdout and never refit during it.
+
+`stage_select` and `stage_holdout` are separate functions, and
+`assert_no_holdout` raises if any development stage is handed season 2025 — so
+tuning against the holdout requires removing a guard, not forgetting one.
+
+### Feature engine
+
+Every feature is captured **before** the current game's result touches any state,
+and games are sequenced by trusted `game_datetime_utc` — never the scheduled
+`date`. Current-season record and rolling form reset each season; a team with no
+prior games this season gets explicit nulls rather than fabricated statistics,
+and a season opener has **null rest**, never an offseason length. Missing values
+are imputed inside the sklearn `Pipeline`, fitted per training split.
+
+Model inputs are an **allowlist** (`features/feature_spec.py`), not a denylist —
+a new leaky column upstream is excluded by default.
+
+### Selection results
+
+**Elo history barely matters.** With offseason regression of 0.5, information
+decays by half each year, so histories of 3, 5, 8, 10, 15 and all-available score
+within **1.2e-8** mean Brier of each other. Twelve configurations tie within
+tolerance; all share K=20 and HCA=40. `all_available` is chosen among the ties
+because it leaves `elo_diff` defined for every logistic training example.
+
+**Logistic history does matter, and recent history wins.** A 5-season window
+(0.21634) beats all-available (0.21709) and 15 seasons (0.21699). Recency-weighted
+all-history with a 2-season half-life is essentially tied (0.21637).
+
+| Elo | Logistic |
+| --- | --- |
+| K = 20, HCA = 40, regression = 0.50, history = all_available | 5-season window, C = 10 |
+
+### 2025-26 holdout
+
+| model | Brier | log loss | acc | AUC | ECE |
+| --- | --- | --- | --- | --- | --- |
+| constant (0.5794) | 0.24765 | 0.68847 | 0.5545 | 0.500 | 0.025 |
+| Elo | 0.20829 | 0.60453 | 0.6837 | 0.731 | 0.038 |
+| logistic | 0.20575 | 0.59834 | 0.6797 | 0.736 | 0.020 |
+| Kalshi raw midpoint | 0.19465 | 0.57014 | 0.6911 | 0.765 | 0.030 |
+| **Kalshi normalized** | **0.19465** | **0.57013** | **0.6911** | **0.765** | 0.034 |
+
+**The market wins.** Paired bootstrap (10,000 resamples, fixed seed; negative
+favours the model):
+
+| comparison | ΔBrier | 95% CI | verdict |
+| --- | --- | --- | --- |
+| logistic − Kalshi | +0.01109 | [+0.0058, +0.0164] | market better |
+| Elo − Kalshi | +0.01364 | [+0.0081, +0.0191] | market better |
+| logistic − Elo | −0.00254 | [−0.0055, +0.0004] | inconclusive |
+
+Kalshi is a **benchmark only** and never enters a model matrix.
 
 ### Do not read a training window into this
 
