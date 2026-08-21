@@ -18,6 +18,8 @@ Kalshi NBA game-winner markets.
   ingestion of player-game and advanced stats. Data foundation only.
 * **Phase 3A3** — lagged possession-adjusted efficiency and rotation features
   built from the paid feeds, ablated against the Phase 3A2 control.
+* **Phase 3A3B0** — availability source audit and the prospective capture
+  foundation for 2026-27. No model.
 
 There is deliberately no model, no frontend, no database service, no trading
 logic, and no execution system here. The goal is a dataset you can *trust*
@@ -1009,12 +1011,313 @@ The paid data produced the **best-calibrated** model so far (ECE 0.027) and a
 small AUC gain, but the improvement over Phase 3A2 is **not statistically
 distinguishable from zero**.
 
+## Phase 3A3B0 — availability sources
+
+```bash
+python -m nba_prediction_market.pipelines.build_availability_audit
+```
+
+Writes `data/reports/availability_source_audit.json`. **No model, and nothing
+merged into Phase 3A3 features** — availability may not become a feature until a
+source's as-of properties are proven.
+
+### The governing rule
+
+An observation is usable only if `observed_at <= prediction_ts`, where
+`prediction_ts = scheduled tipoff - 30 minutes`. That makes **timestamp
+precision**, not history depth, the deciding property of a source. Final
+participation is never a substitute for pregame status.
+
+### Source matrix
+
+| source | historical coverage | intraday precision | status | proj. lineup | conf. lineup | historical as-of | cost |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| NBA official injury report | **rolling ~8 months** | **exact timestamp** | ✓ | ✗ | ✗ | **unsafe** | free |
+| Sportradar Daily Injuries | URL accepts 2013-2026; unverified | **date only** | ✓ | ✗ | ✗ | unknown | trial key needed |
+| SportsDataIO | advertised, depth unknown | unknown | ✓ | ✓ | ✓ | unknown | paid |
+| BALLDONTLIE injuries | none (current state) | **none** | ✓ | ✗ | ✗ | unsafe | owned |
+| BALLDONTLIE lineups | 2025-26 only, post-tip | none | ✗ | ✗ | ✓ | unsafe | owned |
+
+**No audited source can reconstruct a past T-30 state.** Historical availability
+for 2006-2025 appears unrecoverable.
+
+### NBA official report — verified behaviour
+
+`https://ak-static.cms.nba.com/referee/injury/Injury-Report_{YYYY-MM-DD}_{hh}_{mm}{AM|PM}.pdf`
+
+* Published **every 30 minutes, around the clock**.
+* `Last-Modified` matches the filename slot exactly (04:00PM → 21:00:05 GMT in
+  January, 20:00:05 GMT in March — confirming Eastern time with DST).
+* The timestamp also appears in the PDF header.
+* Missing files return **403**, verified by requesting an invalid minute on a
+  valid date.
+* Retention boundary observed between **2025-12-15 (403)** and **2025-12-28
+  (200)**; every date tested in 2016-2025 returned 403.
+* PDFs extract as text with `pypdf` — **no OCR required**.
+
+### Infrastructure built
+
+* **Append-only snapshots** (`data/raw/availability/<source>/<date>/`) — a newer
+  state is a new file beside the old one, never an overwrite. Identical
+  re-captures are skipped; replay with `until=` shows only what existed then.
+* **Normalized events** — `available / probable / questionable / doubtful / out /
+  unknown`, with the raw status always preserved. **Absence from a report is
+  `unknown`, never `available`.**
+* **As-of engine** — `observed_at <= anchor`, with an exactly-at-anchor
+  observation accepted and one a second later rejected. A **date-only**
+  observation is refused for a T-30 anchor rather than silently accepted.
+* **Identity** — resolves by NBA reference id, then registered alias, then exact
+  name *within a team*. Name-only resolution is refused because names collide.
+  Name normalization reconciles the report's `"Porter Jr., Michael"` with
+  BALLDONTLIE's `"Michael Porter Jr."`.
+* **Schedule-aware capture planner** — works backwards from each tipoff and
+  guarantees one capture immediately before the anchor; refuses to emit any
+  capture at or after it.
+
 ### Do not read a training window into this
 
 The point of 20 seasons is to make the history *available*, not to assert it is
 all useful. Whether 3, 5, 8, 10, 15, or all seasons help is an open question to
 be settled by chronological validation **before** the 2025-26 holdout — never by
 2025-26 performance.
+
+## Phase 3A3B1 — salvaging the 2025-26 injury reports
+
+```bash
+python -m nba_prediction_market.pipelines.build_availability_salvage   # recover the archive
+python -m nba_prediction_market.pipelines.run_availability_capture --dry-run   # plan captures
+```
+
+Phase 3A3B0 established that **no audited source can reconstruct a past T-30
+availability state**, and that the NBA's own injury reports survive on the CDN
+for roughly eight months before disappearing. That made this phase
+time-sensitive: whatever was not copied would be gone. This phase copies it, and
+builds the machinery so nothing is lost again.
+
+**Still no model.** Availability is not merged into the Phase 3A3 feature set,
+and will not be until its as-of properties are proven end to end.
+
+### The archive
+
+7,899 reports, **2025-12-22 to 2026-06-13**, ~660 MB, stored append-only at
+`data/raw/availability/nba_official/YYYY/MM/DD/` beside a JSON sidecar recording
+the URL, HTTP status, headers and content hash of every fetch. An identical
+re-fetch is skipped; a *different* payload for a slot already held is written
+alongside as `.conflict-<hash>.pdf` and flagged, never overwritten.
+
+| | |
+| --- | --- |
+| slots checked | 9,264 |
+| reports archived | 7,899 |
+| slots returning 403 | 1,365 |
+| hash conflicts | 0 |
+| errors | 0 |
+| span coverage | 94.6% of all 30-minute slots across 174 days |
+| complete days | 162 / 174 |
+
+The gaps are explained, not merely counted: **2026-02-13 to 02-17** is the
+All-Star break, and the four remaining empty days are Finals off-days.
+
+### 403 means two different things, so the archiver carries a canary
+
+The CDN answers *both* "this report was never published" and "you are being rate
+limited" with **403**. That ambiguity is dangerous in one specific direction: a
+throttled run does not fail loudly, it quietly records real reports as missing.
+
+This was not theoretical. An early archiver run used 8 concurrent workers, was
+rate-limited within seconds, and returned 403 for **every** URL including ones
+already known to exist — 0 reports archived. The block cleared after ~7 minutes.
+
+The fix is in the code, not in the operator's memory:
+
+* requests are **sequential**, with a 0.35 s floor between them;
+* whenever a run sees a 403, it re-checks a **canary** URL known to exist. If
+  the canary also 403s, the run was blocked and the report says so rather than
+  letting the run masquerade as a quiet news day.
+
+The canary held at 200 for the entire salvage run, so the 1,365 403s are genuine
+non-publication. `archive_inventory` additionally flags near-empty days sitting
+between two complete days as `suspect_blocked` — a deliberately conservative
+heuristic that fires on two Finals off-days here, and which the canary evidence
+overrides.
+
+### The parser reads coordinates, not columns
+
+The reports have a real text layer, so **no OCR is used**. But the obvious
+approach — layout-mode text extraction, slice by character offset — is wrong
+here, and wrong silently:
+
+* **the header row prints on page 1 only**; pages 2..N continue the table with
+  no header of their own;
+* **layout mode rescales the character grid per page**, so page 2's offsets bear
+  no relation to page 1's.
+
+An offset-based implementation therefore parsed page 1 and dropped every later
+page: **15 entries out of 117 on a real 8-page report, with no warning raised**.
+Absolute glyph coordinates are identical across pages, so the parser now takes
+column anchors from page 1's header and applies them everywhere by x-position.
+
+Three further quirks, all observed and all handled:
+
+* the page content matrix is a **vertical flip**, so increasing text-space y is
+  the visual reading order;
+* **group columns print once** — game date, time, matchup and team appear on the
+  first row of a block and are carried forward, including across page breaks,
+  since a team's block can span pages;
+* **reasons wrap** onto a continuation row that belongs to the player above.
+
+A team that has not filed prints `NOT YET SUBMITTED` with no player. That is a
+statement about the team, not a wrapped reason for whoever came before, so it is
+recorded separately as an outstanding filing — tied to the specific game it was
+outstanding for, because one report covers several dates.
+
+Result across the full archive: **7,899 / 7,899 reports parsed, 0 failures**, and
+**503,494 player-status rows**. A stratified sample of 140 reports spanning
+December through the Finals produced 0 warnings and a single layout variant.
+
+Two measurements are worth recording together. Under **layout-mode character
+offsets**, header positions shift by a few characters between reports, because
+the PDF uses a proportional font and the extractor snaps glyphs to a character
+grid — fingerprinting on those offsets reported 26 "variants" of what is one
+layout. Under **glyph coordinates**, the same anchors are
+`23.1 / 119.6 / 200.0 / 264.2 / 425.0 / 585.7 / 666.1` in every one of the 7,899
+reports, minimum equal to maximum. The apparent drift was an artifact of the
+extraction mode, not a property of the documents; the layout is now named by its
+column structure and the coordinate range is reported alongside it.
+
+### Coverage, stated as a boundary rather than a percentage
+
+| coverage class | games |
+| --- | --- |
+| valid pre-anchor state | **808** |
+| no surviving report | 422 |
+| **total 2025-26 regular season** | **1,230** |
+
+65.7% is the headline, but the useful statement is sharper: the 422 uncovered
+games run **2025-10-21 to 2025-12-21 without exception**, and coverage from
+**2025-12-22 onward is complete**. The cut is the CDN's retention boundary, not
+a sampling artifact — so the usable window is a clean date range, not a
+scattering of holes.
+
+Report age at the anchor is **0 minutes for all 808 covered games**. That is not
+a bug: every 2025-26 tipoff falls on :00 or :30, so `tipoff − 30 min` lands
+exactly on the report publication grid.
+
+### The leakage guarantee
+
+Every selected report satisfies `report_timestamp <= prediction_ts`. A game
+whose earliest surviving report postdates its anchor is marked unavailable and
+**never backfilled** from a later report. `no_surviving_report` is likewise never
+filled in from an adjacent game or a neighbouring day.
+
+`both_teams_submitted` is nullable on purpose: for the 422 games with no report,
+it is null rather than `False`, because "no report survived" is not the same
+claim as "a team failed to file".
+
+### Player identity, and what is deliberately left unresolved
+
+Resolution is by NBA reference id, then registered alias, then exact name
+*within a team*. Name-only matching is refused because names collide. In
+practice the reports carry no player identifiers, so **every** resolution here
+came from the team-and-name tier — which is precisely why the name repairs below
+matter so much.
+
+Two artifacts of glyph extraction are repaired first, both of them repairs to
+*our own join* rather than fuzzy matches: `"Collins,Zach"` → `"Collins, Zach"`,
+and hyphenated surnames drawn as separate chunks — `"Gilgeous- Alexander"` →
+`"Gilgeous-Alexander"`. The latter alone accounted for 5,857 unresolved rows.
+
+After that repair **495,679 / 503,494 rows (98.45%)** resolve, all of them by
+exact name within a team. The remaining 7,815 rows are just **17 (player, team)
+pairs**, listed by name in the report rather than matched. They fall into three
+kinds, and none of them is a parser defect:
+
+* **Nickname against legal name (6).** The player is on that team's roster under
+  a different given name — `Sarr, Alex` / *Alexandre Sarr*, `Claxton, Nic` /
+  *Nicolas Claxton*, `Bailey, Ace` / *Airious Bailey*, `Hyland, Bones` /
+  *Nah'Shon Hyland*, `Carrington, Bub` / *Carlton Carrington*, `Williams, Nate` /
+  *Jeenathan Williams*.
+* **Listed under a team they had not yet played for (6).** `Gordon, Eric` is on
+  the report for MEM while the registry has him at PHI; likewise Conley, Ball,
+  Boucher, Terry and Landale. Mid-season moves put a player on an injury report
+  before he appears in a box score for the new team.
+* **No 2025-26 box-score appearance at all (3).** `Jones Garcia, David`,
+  `Djurisic, Nikola` and `Hayes-Davis, Nigel` never played an NBA game that
+  season. The registry is derived from player-game stats, so a player with zero
+  appearances has no entry to match — absent by construction, not by error.
+
+All three are left unresolved on purpose. Resolving the first needs an
+explicitly verified alias per player on the Phase 3A0.1 pattern; the second needs
+a date-aware roster rather than a season-level one; the third cannot be resolved
+from box scores at all. A silent name match is exactly the guess this project
+refuses to make.
+
+### Game matching, and four discrepancies worth naming
+
+808 matched, **0 ambiguous**, 93 unmatched. The unmatched count is broken down
+rather than reported bare, because most of it is expected:
+
+* **89** fall after the regular season — play-in and playoff games, outside the
+  1,230-game frame by design;
+* **4** fall inside the regular-season window and are genuine source
+  discrepancies between the league's reports and the schedule:
+  `2026-01-08 MIA@CHI`, `2026-01-24 GSW@MIN`, `2026-01-25 DAL@MIL`,
+  `2026-01-25 DEN@MEM`.
+
+The GSW@MIN case was checked in detail. Six of the seven games in that report's
+date block match the schedule on date *and* Eastern tipoff time exactly; only
+GSW@MIN differs, and the schedule lists that matchup on two consecutive days
+(2026-01-25 and 2026-01-26), which is itself anomalous. The parser reproduces
+the PDF faithfully. **These four are recorded as discrepancies and not
+reconciled** — resolving them needs independent verification, which is the
+Phase 3A0.1 correction-layer process, not a silent edit here.
+
+### Prospective capture
+
+`run_availability_capture` plans captures backwards from each tipoff and refuses
+to emit any capture at or after an anchor. Verified against the full 2025-26
+slate: **1,230 / 1,230 games get a pre-anchor capture, and 0 of 11,070 planned
+tasks land at or after their anchor.** The runner is restart-safe — an
+already-archived slot is skipped rather than refetched — and every capture is
+written to the append-only snapshot store as well as the PDF archive.
+
+Two secondary feeds are wired for **forward-only** capture. Neither carries an
+as-of timestamp or a history endpoint, so the observation time is the moment we
+fetched it and nothing else; the adapters therefore never write a
+`source_report_timestamp`, which is what stops a consumer back-dating today's
+state onto an earlier game.
+
+* **BALLDONTLIE `/v1/player_injuries`** — snapshotted forward. Its *historical*
+  use remains prohibited.
+* **SportsDataIO** — a deliberately inert placeholder. There is no subscription
+  and no response shape verified against live data, and enabling a feed on the
+  strength of vendor documentation alone would put unverified data into the
+  availability store.
+
+### Kalshi multi-anchor benchmark
+
+Seven research anchors are reconstructible from one cached candle stream —
+`T-24h, T-6h, T-3h, T-1h, T-30m, T-15m, T-5m` — each resolved by the Phase 2
+selector, so the same lookahead guarantee applies at every anchor. Kalshi remains
+a **benchmark only, never a model feature**.
+
+One honest limitation: the Phase 2 cache was fetched under the slug
+`t30_lb60_p1` — a 60-minute window *ending* at T-30. It can serve T-1h and T-30m
+and nothing else; T-24h/6h/3h fall before the window starts and T-15m/5m after it
+ends. Backfilling the full anchor set needs a refetch at the wider window, one
+request per market. Because the cache slug is part of the cache path, that
+refetch lands in its own directory and cannot overwrite the Phase 2 quotes.
+**Implemented and tested; not backfilled.**
+
+### Outputs
+
+| file | contents |
+| --- | --- |
+| `data/raw/availability/nba_official/` | 7,899 PDFs + per-fetch JSON sidecars |
+| `nba_official_availability_events_2025_26.parquet` | 503,494 player-status rows |
+| `nba_game_availability_t30_partial_2025_26.parquet` | 1,230 games, T-30 state where recoverable |
+| `data/reports/nba_official_archive_salvage.json` | coverage, identity, matching, drift |
+| `data/reports/availability_capture_run.json` | prospective capture run log |
 
 ## Phase 1 run results (2025-26)
 
@@ -1058,6 +1361,27 @@ Every unmatched record has an identified cause:
 
 ## Known limitations & assumptions to review
 
+* **Availability history is unrecoverable before 2025-12-22.** The NBA CDN
+  retains reports for roughly eight months, so the 2025-26 T-30 states begin at
+  the retention boundary and the 2006-2025 seasons have none at all. Any
+  availability feature must therefore be evaluated on the covered window only,
+  and must never be back-filled from a later report or a neighbouring game.
+* **Four report-vs-schedule discrepancies are recorded, not reconciled.**
+  `2026-01-08 MIA@CHI`, `2026-01-24 GSW@MIN`, `2026-01-25 DAL@MIL` and
+  `2026-01-25 DEN@MEM` appear in the league's reports on dates the schedule does
+  not have. The parser reproduces the PDFs faithfully; deciding which source is
+  right needs independent verification on the Phase 3A0.1 pattern.
+* **A residue of 17 (player, team) pairs is left unresolved rather than
+  fuzzy-matched.** After repairing the glyph-join artifacts, what remains is
+  nicknames against legal names, players listed under a team before their first
+  box score for it, and players with no 2025-26 appearance at all. Each needs a
+  different remedy — a verified alias, a date-aware roster, or a roster source
+  that is not derived from box scores — and none is a safe guess. They are
+  listed by name in the salvage report.
+* **`suspect_blocked_days` is a conservative heuristic, not a verdict.** It
+  flags near-empty days bracketed by complete days, and on the current archive it
+  fires on two Finals off-days. The canary evidence — a known-good URL returning
+  200 throughout the run — is the authority on whether a run was throttled.
 * **Season window.** A season is assumed to fall entirely within 1 Jul (year N)
   through 30 Jun (year N+1). Kalshi's archive is one undated multi-season
   stream, so *some* explicit window is unavoidable. It is defined in
@@ -1124,6 +1448,19 @@ src/nba_prediction_market/
   ingestion/candle_cache.py     resumable per-market raw response cache
   matching/team_names.py        30 franchises, exact aliases, no fuzzy matching
   matching/game_market_matcher.py   deterministic join + classification
+  availability/sources.py            audited source matrix + as-of classes
+  availability/snapshot_store.py     append-only immutable capture store
+  availability/as_of.py              observed_at <= prediction_ts enforcement
+  availability/identity.py           player resolution, no silent fuzzy matching
+  availability/capture_schedule.py   schedule-aware prospective capture planner
+  availability/nba_official.py       report URL slots + immutable PDF archive
+  availability/nba_report_parser.py  coordinate-based PDF table parser
+  availability/archive_inventory.py  archive coverage, gaps, blocked-run suspicion
+  availability/runner.py             prospective capture runner + anchor health
+  availability/prospective_adapters.py  forward-only secondary feeds
+  availability/kalshi_anchors.py     multi-anchor benchmark reconstruction
   pipelines/build_dataset.py         Phase 1 CLI entry point
   pipelines/build_pregame_quotes.py  Phase 2 CLI entry point
+  pipelines/build_availability_audit.py     Phase 3A3B0 CLI entry point
+  pipelines/build_availability_salvage.py   Phase 3A3B1 CLI entry point
 ```
