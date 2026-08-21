@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import logging
 from collections.abc import Callable, Iterator
-from typing import Any
+from typing import Any, Final
 
 import httpx
 
@@ -16,6 +16,12 @@ from nba_prediction_market.config import (
 )
 
 logger = logging.getLogger(__name__)
+
+#: GOAT tier allows 600 requests/minute (verified from the ``x-ratelimit-limit``
+#: response header). 0.11s spacing stays comfortably under it.
+GOAT_MIN_INTERVAL: Final = 0.11
+#: Every paginated NBA endpoint caps ``per_page`` at 100; 500 returns HTTP 400.
+MAX_PER_PAGE: Final = 100
 
 
 def _next_cursor(payload: dict[str, Any]) -> Any:
@@ -92,3 +98,27 @@ class BallDontLieClient(BaseApiClient):
             games.extend(page)
         logger.info("Fetched %d BALLDONTLIE games for season %s", len(games), season)
         return games
+
+
+    def iter_paid_records(
+        self,
+        path: str,
+        season: int,
+        *,
+        per_page: int = MAX_PER_PAGE,
+        on_page: Callable[[int, dict[str, Any]], None] | None = None,
+    ) -> Iterator[list[dict[str, Any]]]:
+        """Yield pages from a season-filtered paid endpoint.
+
+        Covers ``/v1/stats``, ``/v1/stats/advanced`` and ``/v2/stats/advanced``,
+        which share the same cursor pagination and ``seasons[]`` filter.
+        """
+        if not 1 <= per_page <= MAX_PER_PAGE:
+            raise ValueError(f"per_page must be within 1..{MAX_PER_PAGE}, got {per_page}")
+        yield from self.paginate(
+            path,
+            params={"seasons[]": season, "per_page": per_page},
+            items_key="data",
+            next_cursor=_next_cursor,
+            on_page=on_page,
+        )

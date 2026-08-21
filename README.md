@@ -14,6 +14,10 @@ Kalshi NBA game-winner markets.
   holdout evaluation against the Kalshi benchmark.
 * **Phase 3A2** — improved team-strength representation: margin-of-victory Elo,
   opponent-adjusted margin, and a predetermined feature-bundle ablation.
+* **Phase 3A3A0** — paid (GOAT-tier) data capability audit and historical
+  ingestion of player-game and advanced stats. Data foundation only.
+* **Phase 3A3** — lagged possession-adjusted efficiency and rotation features
+  built from the paid feeds, ablated against the Phase 3A2 control.
 
 There is deliberately no model, no frontend, no database service, no trading
 logic, and no execution system here. The goal is a dataset you can *trust*
@@ -846,6 +850,164 @@ Paired bootstrap (10,000 resamples, fixed seed; negative favours the model):
 
 The improvement over Phase 3A1 is real but small; the gap to the market narrowed
 from 0.0111 to 0.0099 and remains clearly significant.
+
+## Phase 3A3A0 — paid data audit
+
+```bash
+python -m nba_prediction_market.pipelines.build_paid_data
+```
+
+Audits what the GOAT tier actually provides, ingests the feeds that are safe,
+and writes `data/reports/paid_data_audit.json`. **Nothing is merged into the
+Phase 3A1/3A2 feature datasets** — this phase is foundation only.
+
+### Endpoint capability matrix
+
+Every row verified empirically against the live API on 2026-08-20, not taken
+from documentation.
+
+| endpoint | tier | verified seasons | granularity | safety |
+| --- | --- | --- | --- | --- |
+| `/v1/stats` | ALL-STAR | 2006–2025 | player × game | **A** safe when lagged |
+| `/v1/stats/advanced` | GOAT | 2006–2025 | player × game | **A** safe when lagged |
+| `/v2/stats/advanced` | GOAT | **2012**–2025 | player × game × period | **A** safe when lagged |
+| `/v1/box_scores` | GOAT | 2006–2025 | game | **A** (no new pregame info) |
+| `/v1/season_averages` | GOAT | 1996–2025 | player × season | **C** prohibited |
+| `/v1/player_injuries` | ALL-STAR | current state only | player | **B** prohibited |
+| `/v1/lineups` | GOAT | **2025 only** | player × game | **C** prohibited |
+
+Safety classes: **A** safe as a historical input *when lagged to prior games*;
+**B** usable only prospectively; **C** post-tip/post-game, unsafe for a
+same-game T-30 prediction.
+
+### Three prohibitions
+
+**Lineups must never be a historical T-30 feature.** Documented as available only
+once a game begins, and verified: zero rows for a 2006 game, zero for a 2024
+game, twenty rows for a 2025-26 game. The `starter` flag is exactly the
+information we would want and exactly what is not available before tip. That a
+historical lineup can be retrieved *today* says nothing about what was known at
+our prediction timestamp.
+
+**Injuries are prospective-only.** Records carry `player`, `status`,
+`return_date` and `description` — **no as-of timestamp, no history, no date
+filter**. Verified: descriptions discuss the 2025-26 season in the past tense, so
+the feed is today's state. A current injury record must never be attached to an
+old game. It can be snapshotted forward from now on, but the past is
+unrecoverable from this source.
+
+**Season averages must not be attached retrospectively.** They are completed
+full-season aggregates; using one inside its own season imports results that had
+not happened yet. The player-game feed already provides the same information in a
+lookahead-safe, game-by-game form.
+
+### Documentation discrepancies found
+
+* V2 advanced stats are documented as "2015 season onward"; the feed actually
+  returns data from **2012**.
+* Coverage is not uniform within V2: tracking fields (speed, distance, touches,
+  passes, possessions) begin in **2012**, hustle fields (deflections, contested
+  shots, box-outs) only in **2016**. Two distinct discontinuities.
+
+### Other verified facts
+
+* GOAT rate limit is **600 req/min** (`x-ratelimit-limit` header); `per_page`
+  caps at **100** (500 returns HTTP 400).
+* **Advanced stats are player-level only.** A game's twelve rows for a team carry
+  twelve *different* pace and rating values, because each is that player's
+  on-court estimate. Team-level pace or ratings must be aggregated deliberately
+  (minutes-weighted), never read off one row.
+* `min` is `null` on ~15% of player rows, and those rows have every other stat
+  null too. They are absent observations, not zero-minute appearances, so
+  minutes parse to `None` rather than `0`.
+* The minutes format is **mixed within a single season** — both `MM:SS` and bare
+  integers appear in 2006-07.
+
+## Phase 3A3 — lagged advanced team and rotation features
+
+```bash
+python -m nba_prediction_market.pipelines.build_paid_features
+```
+
+Derives a team-game box score from the paid player feed, estimates possessions
+and four factors, lags them into pregame features, and adds a rotation family
+built purely from prior-game minutes. Phase 3A1/3A2 artefacts are read but never
+written.
+
+### Team-game derivation
+
+Player rows aggregate to two observations per game. **Possessions are an
+estimate, not an official NBA statistic** — Oliver's formula as used by
+Basketball-Reference:
+
+```
+0.5 * (team + opponent), each side =
+    FGA + 0.44*FTA - 1.07*(OREB/(OREB+OppDREB))*(FGA-FGM) + TOV
+```
+
+Validated across 48,060 team-games: median 96.5, p1 82.8, p99 113.5, only 2
+outside [60,140], none non-positive. The four corrected 4OT games correctly
+estimate ~132 possessions.
+
+**Nothing is fabricated.** The 16 team-games whose player points do not
+reconcile with the trusted score are flagged `box_score_complete = False`, their
+source totals preserved, and every derived efficiency value set to null. They are
+then excluded from rolling efficiency rather than imputed at source; the model
+pipeline imputes on training data only.
+
+### Rotation features — definitions
+
+All computed from a team's **prior** games only:
+
+* **minute share** — a player's minutes in a window over all team minutes in it.
+* **HHI** — `sum(share²)`; near `1/N` for an even N-man rotation.
+* **overlap(A,B)** — `sum over players of min(share_A(p), share_B(p))`. It is 1.0
+  when two windows distribute minutes identically, 0.0 when they share nobody.
+  Minutes-weighted by construction, so losing a starter costs far more than
+  losing a fringe player.
+* **rotation disruption** — compares a baseline window (games t-10…t-4) against a
+  recent one (t-3…t-1), summing each player's minute shortfall.
+
+**This is not an injury feature.** A player who stopped appearing three games ago
+is visible; a player returning tonight is not, and must not be.
+
+Player quality is a per-36 plus-minus shrunk toward zero by
+`games/(games+20)`, so a 0.3-minute cameo cannot produce a large rating.
+
+### Ablation result — one family worked, one clearly did not
+
+| bundle | features | mean Brier | AUC |
+| --- | --- | --- | --- |
+| A (Phase 3A2 control) | 12 | 0.21609 | 0.7027 |
+| B (+ efficiency / four factors) | 24 | **0.21635** ✗ | 0.7017 |
+| C (+ roster continuity) | 18 | 0.21568 ✓ | 0.7035 |
+| **D (+ rotation disruption)** | **15** | **0.21553** ✓ | **0.7044** |
+| E (+ player quality) | 13 | **0.21659** ✗ | 0.7012 |
+| F (C + D combined) | 21 | 0.21568 | 0.7032 |
+
+**Possession-adjusted efficiency made the model worse** — it is still a
+score-derived measure, and Phase 3A2 already showed that vein is exhausted.
+**Rotation disruption helped**, and combining it with roster continuity added
+nothing over disruption alone, so the simpler bundle D was frozen.
+
+### 2025-26 (secondary benchmark)
+
+| model | Brier | log loss | acc | AUC | ECE |
+| --- | --- | --- | --- | --- | --- |
+| Phase 3A2 logistic | 0.20451 | 0.59552 | 0.6927 | 0.7396 | 0.034 |
+| **Phase 3A3 logistic** | **0.20369** | **0.59366** | 0.6894 | 0.7419 | **0.027** |
+| MOV Elo | 0.20440 | 0.59564 | 0.6927 | 0.7400 | 0.040 |
+| Kalshi normalized | **0.19465** | **0.57013** | 0.6911 | **0.7650** | 0.034 |
+
+| comparison | ΔBrier | 95% CI | verdict |
+| --- | --- | --- | --- |
+| 3A3 − 3A2 | −0.00082 | [−0.0022, +0.0005] | **inconclusive** |
+| 3A3 − MOV Elo | −0.00072 | [−0.0034, +0.0020] | **inconclusive** |
+| 3A3 − Kalshi | +0.00903 | [+0.0040, +0.0141] | market better |
+
+The paid data produced the **best-calibrated** model so far (ECE 0.027) and a
+small AUC gain, but the improvement over Phase 3A2 is **not statistically
+distinguishable from zero**.
 
 ### Do not read a training window into this
 
