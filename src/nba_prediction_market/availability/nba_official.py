@@ -1,20 +1,38 @@
 """Official NBA injury-report archive: URL construction and immutable capture.
 
-The league publishes a PDF every 30 minutes, around the clock, at::
+The league has published under **two filename conventions**, and telling them
+apart is what makes the historical archive reachable at all::
 
-    https://ak-static.cms.nba.com/referee/injury/Injury-Report_{YYYY-MM-DD}_{hh}_{mm}{AM|PM}.pdf
+    modern  Injury-Report_{YYYY-MM-DD}_{hh}_{mm}{AM|PM}.pdf   every 30 minutes
+    legacy  Injury-Report_{YYYY-MM-DD}_{hh}{AM|PM}.pdf        hourly, at :30
+
+The cutover is sharp and was measured, not assumed: on 2025-12-22 the legacy
+name still serves the 08:30 ET report while the modern name first serves the
+09:00 ET one. Requests in the wrong convention return 403.
+
+**This corrects an earlier misreading.** Phase 3A3B0 probed 2025-26-era names
+against older dates, got 403, and concluded the CDN retained only ~8 months.
+That boundary was the convention change, not a retention limit: reports remain
+fetchable back to 2018-12-17 under the legacy name.
+
+Two properties of the legacy convention matter for correctness:
+
+* the filename carries only the hour, but the report inside is stamped at
+  **:30 past** it -- ``05PM`` is the 5:30 PM report, so reading the filename as
+  5:00 would understate the timestamp by half an hour and risk selecting a
+  report published *after* an anchor;
+* the publication cadence itself changed. Three slots a day (01PM/05PM/08PM)
+  through 2020-21, hourly from 2021-22, half-hourly from the cutover.
 
 The filename time is **Eastern**, and it is authoritative: fetching the 6:30
 report at 6:59 does not make its contents a 6:59 observation. Both timestamps
-are therefore preserved -- ``report_timestamp`` from the filename and
-``retrieved_at_utc`` from us.
+are preserved -- ``report_timestamp`` from the slot and ``retrieved_at_utc``
+from us. The parser additionally reads the timestamp printed inside the PDF,
+which is the authority if the two ever disagree.
 
-A missing report returns **403**, not 404 (verified by requesting an invalid
-minute on a valid date), so 403 means "not available" rather than a transient
-server fault.
-
-The CDN retains only a rolling window of roughly eight months, which is why
-capture is urgent: older reports are being deleted as time passes.
+A missing report returns **403**, not 404, so 403 means "not available" rather
+than a transient server fault -- and, unhelpfully, it is also what a throttled
+client sees, which is why callers pair it with a canary.
 """
 
 from __future__ import annotations
@@ -34,12 +52,19 @@ BASE_URL: Final = "https://ak-static.cms.nba.com/referee/injury"
 #: The league publishes on this grid, in minutes past the hour.
 SLOT_MINUTES: Final[tuple[int, ...]] = (0, 30)
 EASTERN: Final = ZoneInfo("America/New_York")
+#: Minute past the hour at which every legacy-convention report is stamped.
+LEGACY_SLOT_MINUTE: Final = 30
 USER_AGENT: Final = (
     "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 "
     "(KHTML, like Gecko) Chrome/120.0 Safari/537.36"
 )
 #: HTTP status the CDN returns for a report that does not exist.
 NOT_AVAILABLE_STATUS: Final = 403
+#: First report published under the modern half-hourly filename. Measured: the
+#: 08:30 ET report that day is legacy-named, the 09:00 ET one is modern-named.
+CONVENTION_CUTOVER_ET: Final = datetime(2025, 12, 22, 9, 0, tzinfo=EASTERN)
+#: Earliest report the CDN still serves, found by bisection.
+EARLIEST_AVAILABLE_REPORT_DATE: Final = date(2018, 12, 17)
 
 
 @dataclass(frozen=True)
@@ -52,11 +77,16 @@ class ReportSlot:
     meridiem: str
 
     @property
+    def is_legacy(self) -> bool:
+        """True when this slot predates the filename cutover."""
+        return self.report_timestamp_et < CONVENTION_CUTOVER_ET
+
+    @property
     def filename(self) -> str:
-        return (
-            f"Injury-Report_{self.report_date.isoformat()}_"
-            f"{self.hour_12:02d}_{self.minute:02d}{self.meridiem}.pdf"
-        )
+        stem = f"Injury-Report_{self.report_date.isoformat()}_{self.hour_12:02d}"
+        if self.is_legacy:
+            return f"{stem}{self.meridiem}.pdf"
+        return f"{stem}_{self.minute:02d}{self.meridiem}.pdf"
 
     @property
     def url(self) -> str:
@@ -91,14 +121,37 @@ class ReportSlot:
         }
 
 
+def _slot(report_date: date, hour_24: int, minute: int) -> ReportSlot:
+    return ReportSlot(
+        report_date,
+        hour_24 % 12 or 12,
+        minute,
+        "AM" if hour_24 < 12 else "PM",
+    )
+
+
 def slots_for_date(report_date: date) -> list[ReportSlot]:
-    """All 48 half-hourly slots for one calendar date, in chronological order."""
+    """Every candidate slot for one calendar date, in chronological order.
+
+    Which grid applies depends on where the date sits relative to the filename
+    cutover: hourly (at :30) before it, half-hourly after. The cutover day
+    itself carries both, split at the cutover instant, which is why it has 39
+    candidates rather than 24 or 48.
+
+    These are *candidates*. Cadence varied by era -- only three slots a day were
+    published through 2020-21 -- so an absent slot answers 403 and is recorded
+    as unavailable rather than treated as an error.
+    """
     out: list[ReportSlot] = []
     for hour_24 in range(24):
-        meridiem = "AM" if hour_24 < 12 else "PM"
-        hour_12 = hour_24 % 12 or 12
+        legacy = _slot(report_date, hour_24, LEGACY_SLOT_MINUTE)
+        if legacy.is_legacy:
+            out.append(legacy)
+            continue
         for minute in SLOT_MINUTES:
-            out.append(ReportSlot(report_date, hour_12, minute, meridiem))
+            candidate = _slot(report_date, hour_24, minute)
+            if not candidate.is_legacy:
+                out.append(candidate)
     return sorted(out, key=lambda s: (s.hour_24, s.minute))
 
 
@@ -109,11 +162,17 @@ def slot_from_filename(filename: str) -> ReportSlot | None:
         return None
     try:
         _, day, clock = stem.split("_", 2)
-        hour_text, rest = clock.split("_", 1)
-        minute_text, meridiem = rest[:2], rest[2:]
-        return ReportSlot(
-            date.fromisoformat(day), int(hour_text), int(minute_text), meridiem
-        )
+        if "_" in clock:
+            hour_text, rest = clock.split("_", 1)
+            minute_text, meridiem = rest[:2], rest[2:]
+            minute = int(minute_text)
+        else:
+            # Legacy name carries only the hour; the report is stamped at :30.
+            hour_text, meridiem = clock[:2], clock[2:]
+            minute = LEGACY_SLOT_MINUTE
+        if meridiem not in ("AM", "PM"):
+            return None
+        return ReportSlot(date.fromisoformat(day), int(hour_text), minute, meridiem)
     except (ValueError, IndexError):
         return None
 
@@ -127,10 +186,15 @@ def latest_slot_at_or_before(anchor: datetime) -> ReportSlot:
     if anchor.tzinfo is None:
         raise ValueError("anchor must be timezone-aware")
     eastern = anchor.astimezone(EASTERN).replace(second=0, microsecond=0)
-    eastern -= timedelta(minutes=eastern.minute % 30)
-    hour_12 = eastern.hour % 12 or 12
-    meridiem = "AM" if eastern.hour < 12 else "PM"
-    return ReportSlot(eastern.date(), hour_12, eastern.minute, meridiem)
+    candidate = eastern - timedelta(minutes=eastern.minute % 30)
+    slot = _slot(candidate.date(), candidate.hour, candidate.minute)
+    if not slot.is_legacy:
+        return slot
+    # Legacy reports exist only at :30, so an anchor in the first half of an
+    # hour resolves to the previous hour's report, crossing midnight if needed.
+    if eastern.minute < LEGACY_SLOT_MINUTE:
+        eastern -= timedelta(hours=1)
+    return _slot(eastern.date(), eastern.hour, LEGACY_SLOT_MINUTE)
 
 
 # --- immutable archive -----------------------------------------------------

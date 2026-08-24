@@ -79,6 +79,17 @@ def _tidy(value: str) -> str:
     return _SPACES.sub(" ", value).strip()
 
 
+def _rejoin_hyphens(value: str) -> str:
+    """Close a hyphen that glyph extraction split across chunks.
+
+    "Two-Way" arrives as "Two-" and "Way" and joins to "Two- Way". A hyphen
+    directly attached to the preceding word never takes a space after it, so
+    closing that gap is safe -- and it leaves the report's own " - " separator
+    alone, since that hyphen has a space on both sides.
+    """
+    return re.sub(r"(\w)-\s+(\w)", r"\1-\2", value)
+
+
 def _tidy_name(value: str) -> str:
     """Tidy a player name, repairing two artifacts of glyph extraction.
 
@@ -89,7 +100,7 @@ def _tidy_name(value: str) -> str:
     """
     text = _tidy(value)
     text = re.sub(r",\s*", ", ", text)
-    return re.sub(r"(\w)-\s+(\w)", r"\1-\2", text)
+    return _rejoin_hyphens(text)
 
 
 @dataclass
@@ -177,9 +188,42 @@ class ParsedReport:
         }
 
 
-HEADER_LABEL_SEQUENCE: Final[tuple[str, ...]] = (
-    "Game", "Game", "Matchup", "Team", "Player", "Current", "Reason",
+@dataclass(frozen=True)
+class LayoutVariant:
+    """One published column layout, named by its header labels in order."""
+
+    name: str
+    labels: tuple[str, ...]
+    #: Canonical field each column feeds. ``None`` keeps the column's text
+    #: without letting it drive the seven-field row model.
+    fields: tuple[str | None, ...]
+
+    def index_of(self, field: str) -> int | None:
+        return self.fields.index(field) if field in self.fields else None
+
+
+#: The seven-column layout published from the 2019-20 season onward.
+LAYOUT_V1: Final = LayoutVariant(
+    name="columnar_v1_7col",
+    labels=("Game Date", "Game Time", "Matchup", "Team",
+            "Player Name", "Current Status", "Reason"),
+    fields=("game_date", "game_time", "matchup", "team",
+            "player_name", "status", "reason"),
 )
+
+#: The nine-column layout published in 2018-19. It splits what later became a
+#: single Reason string into "Category" plus "Reason", orders Reason before
+#: Current Status, and carries a Previous Status column that was later dropped.
+LAYOUT_V0: Final = LayoutVariant(
+    name="columnar_v0_9col",
+    labels=("Game Date", "Game Time", "Matchup", "Team", "Player Name",
+            "Category", "Reason", "Current Status", "Previous Status"),
+    fields=("game_date", "game_time", "matchup", "team", "player_name",
+            "category", "reason", "status", "previous_status"),
+)
+
+#: Tried in order; the first whose labels all appear wins.
+LAYOUT_VARIANTS: Final[tuple[LayoutVariant, ...]] = (LAYOUT_V0, LAYOUT_V1)
 
 #: Glyphs land a hair right of their header label (426.0 vs 425.0), so a cell is
 #: assigned to the last anchor at or left of its x, within this slack.
@@ -188,7 +232,14 @@ _ANCHOR_SLACK: Final = 2.0
 #: Chunks whose text-space y differs by less than this belong to one visual row.
 _ROW_TOLERANCE: Final = 1.0
 
-_PAGE_MARKER = re.compile(r"^Page\s+\d+\s+of\s+\d+$", re.IGNORECASE)
+#: The page marker is not always drawn as one piece. In the portrait-rotated
+#: era the trailing page count sits on its own baseline, so the row reads
+#: "Page 1 of" -- and on some layouts a stray count leads it ("6 Page 1 of").
+#: Requiring the complete "Page 1 of 8" let the fragment fall into the Player
+#: column and become a player named "Page 1 of", 34,000 rows of them.
+_PAGE_MARKER = re.compile(r"^\d*\s*Page\s+\d+\s+of(\s+\d+)?$", re.IGNORECASE)
+#: A row carrying nothing but a number is the page marker's detached count.
+_BARE_NUMBER = re.compile(r"^\d{1,3}$")
 _NOT_SUBMITTED = re.compile(r"NOT\s+YET\s+SUBMITTED", re.IGNORECASE)
 
 
@@ -205,18 +256,51 @@ class TextRow:
         return _tidy(" ".join(text for _, text in self.cells))
 
 
-def extract_page_rows(page: Any, page_number: int) -> list[TextRow]:
-    """Group one page's glyphs into visual rows, in reading order.
+def display_position(cm: Any, tm: Any, rotation: int) -> tuple[float, float]:
+    """Map a glyph to ``(column, row)`` keys in the page's *displayed* frame.
 
-    Rows are returned by increasing text-space y, which the page's flipping
-    content matrix makes equivalent to reading top to bottom.
+    Working in displayed coordinates rather than raw text space is what lets one
+    code path read every era of the report. The league has shipped the same
+    table under two quite different page geometries:
+
+    * **2024 onward** -- landscape media box, no ``/Rotate``, content matrix a
+      vertical flip ``(1,0,0,-1)``.
+    * **through 2023** -- *portrait* media box with ``/Rotate 90``, content
+      drawn sideways under ``(0,1,-1,0)``. Read without the rotation the table
+      comes out transposed: each apparent row is an entire column, so a whole
+      report's statuses arrive concatenated into one string.
+
+    Composing the content matrix with the page rotation resolves both. Only the
+    ordering of the returned keys is meaningful, not their origin: rotation
+    preserves distance, so the row and column tolerances stay valid in points.
     """
+    a, b, c, d, e, f = (float(v) for v in cm)
+    tx, ty = float(tm[4]), float(tm[5])
+    ux = a * tx + c * ty + e
+    uy = b * tx + d * ty + f
+    # Row keys are returned so that *ascending* order is top-to-bottom reading
+    # order, which the rest of the parser assumes.
+    match (rotation or 0) % 360:
+        case 90:
+            return (uy, ux)
+        case 180:
+            return (-ux, uy)
+        case 270:
+            return (-uy, -ux)
+        case _:
+            return (ux, -uy)
+
+
+def extract_page_rows(page: Any, page_number: int) -> list[TextRow]:
+    """Group one page's glyphs into visual rows, in reading order."""
     chunks: list[tuple[float, float, str]] = []
+    rotation = int(page.get("/Rotate") or 0)
 
     def visitor(text: str, cm: Any, tm: Any, font_dict: Any, font_size: Any) -> None:
         stripped = text.strip()
         if stripped:
-            chunks.append((float(tm[4]), float(tm[5]), stripped))
+            column, row = display_position(cm, tm, rotation)
+            chunks.append((column, row, stripped))
 
     page.extract_text(visitor_text=visitor)
 
@@ -235,40 +319,194 @@ def extract_page_rows(page: Any, page_number: int) -> list[TextRow]:
     return rows
 
 
-def header_anchors(row: TextRow) -> list[float] | None:
-    """Column x-anchors from a header row, or None if this is not one."""
+def _squash(value: str) -> str:
+    return value.replace(" ", "").casefold()
+
+
+def _anchors_for_labels(row: TextRow, labels: tuple[str, ...]) -> list[float] | None:
+    """x-anchors for a specific label sequence, or None if the row lacks it.
+
+    A label may span several consecutive chunks; the anchor is the x of the
+    first chunk that starts it.
+    """
     anchors: list[float] = []
-    remaining = list(row.cells)
-    for label in HEADER_LABEL_SEQUENCE:
-        for index, (x, text) in enumerate(remaining):
-            if text == label:
-                anchors.append(x)
-                remaining = remaining[index + 1:]
-                break
-        else:
+    cells = list(row.cells)
+    position = 0
+    for label in labels:
+        target = _squash(label)
+        matched = False
+        while position < len(cells) and not matched:
+            start_x = cells[position][0]
+            accumulated = ""
+            for end in range(position, len(cells)):
+                accumulated += _squash(cells[end][1])
+                if accumulated == target:
+                    anchors.append(start_x)
+                    position = end + 1
+                    matched = True
+                    break
+                if not target.startswith(accumulated):
+                    break
+            if not matched:
+                position += 1
+        if not matched:
             return None
     return anchors
 
 
-def layout_fingerprint(anchors: list[float]) -> str:
-    """Name the layout by its column *structure*, not its exact geometry.
+def match_header(row: TextRow) -> tuple[LayoutVariant, list[float]] | None:
+    """Identify which published layout a header row belongs to.
 
-    Anchor positions shift slightly between reports; what defines the layout is
-    the column count. Per-report anchors are read from that report's own header,
-    so drift is handled correctly regardless.
+    The nine-column layout is tried first: its labels are a superset of the
+    seven-column one, so testing the shorter sequence first would match a
+    2018-19 header and then silently read Category as Current Status.
     """
-    return f"columnar_v1_{len(anchors)}col"
+    for variant in LAYOUT_VARIANTS:
+        anchors = _anchors_for_labels(row, variant.labels)
+        if anchors is not None:
+            return variant, anchors
+    return None
 
 
-def _row_fields(row: TextRow, anchors: list[float]) -> dict[str, str]:
-    """Bucket a row's chunks into the seven named columns."""
+def header_anchors(row: TextRow) -> list[float] | None:
+    """Column x-anchors from a header row, or None if this is not one."""
+    found = match_header(row)
+    return found[1] if found else None
+
+
+def _reason_pieces_by_owner(
+    body: list[TextRow], anchors: list[float], variant: LayoutVariant
+) -> dict[int, str]:
+    """Rebuild each player's Reason cell from individually placed glyphs.
+
+    The Reason cell is drawn vertically centred inside its row, while the
+    player name sits on the row's own baseline. For a wrapped reason the two do
+    not line up: its first line can be drawn *above* the player it describes
+    and its second below, so grouping text into rows by y and then reading a
+    Reason column mixes fragments from neighbouring players -- and a single
+    grouped row can hold the tail of one reason and the head of the next.
+
+    Assigning each reason glyph to the nearest player baseline on its own page
+    reconstructs the cell as drawn. Only the Reason column is treated this way;
+    the grouping columns print on their block's first row, not centred, which
+    is why they carry forward correctly.
+    """
+    reason_index = variant.index_of("reason")
+    if reason_index is None:
+        return {}
+
+    baselines = [
+        (index, row.y, row.page)
+        for index, row in enumerate(body)
+        if _tidy(_row_fields(row, anchors, variant)["player_name"])
+    ]
+    if not baselines:
+        return {}
+
+    collected: dict[int, list[tuple[float, float, str]]] = {}
+    for row in body:
+        if (_PAGE_MARKER.match(row.text) or _BARE_NUMBER.match(row.text)
+                or _TIMESTAMP.search(row.text)):
+            continue
+        if match_header(row) is not None:
+            continue
+        # A team's "not yet submitted" marker is drawn in the Reason column but
+        # describes the team, not any player. Folding it into the nearest
+        # player's reason would attribute a filing state to an individual.
+        row_fields = _row_fields(row, anchors, variant)
+        if not _tidy(row_fields["player_name"]) and _NOT_SUBMITTED.search(row.text):
+            continue
+        for x, text in row.cells:
+            bucket = bisect_right(anchors, x + _ANCHOR_SLACK) - 1
+            if max(bucket, 0) != reason_index:
+                continue
+            same_page = [b for b in baselines if b[2] == row.page]
+            if not same_page:
+                continue
+            owner = min(same_page, key=lambda b: abs(b[1] - row.y))[0]
+            collected.setdefault(owner, []).append((row.y, x, text))
+
+    return {
+        owner: _rejoin_hyphens(
+            _tidy(" ".join(text for _, _, text in sorted(pieces)))
+        )
+        for owner, pieces in collected.items()
+    }
+
+
+def _continuation_owners(
+    body: list[TextRow], anchors: list[float], variant: LayoutVariant
+) -> dict[int, int]:
+    """Map each continuation row to the player row that owns it.
+
+    Reason text is drawn vertically centred inside its cell, so a wrapped
+    reason straddles the row boundary: one line can sit above the player name
+    it belongs to and the next below it. Assigning continuation lines by their
+    position in the stream therefore hands the first line to the *previous*
+    player and produces two players' reasons welded together.
+
+    Nearest player row by vertical distance recovers the intended owner, and
+    ownership never crosses a page boundary.
+    """
+    player_rows: list[tuple[int, float, int]] = []
+    for index, row in enumerate(body):
+        fields = _row_fields(row, anchors, variant)
+        if _tidy(fields["player_name"]):
+            player_rows.append((index, row.y, row.page))
+    if not player_rows:
+        return {}
+
+    owners: dict[int, int] = {}
+    for index, row in enumerate(body):
+        fields = _row_fields(row, anchors, variant)
+        if _tidy(fields["player_name"]):
+            continue
+        same_page = [p for p in player_rows if p[2] == row.page]
+        if not same_page:
+            continue
+        nearest = min(same_page, key=lambda p: abs(p[1] - row.y))
+        owners[index] = nearest[0]
+    return owners
+
+
+def _is_bare_team_fragment(fields: dict[str, str]) -> bool:
+    """True when a row carries a team cell and nothing else at all."""
+    return not any(
+        fields.get(name)
+        for name in ("game_date", "game_time", "matchup", "player_name",
+                     "status", "reason", "category", "previous_status")
+    )
+
+
+def _row_fields(
+    row: TextRow, anchors: list[float], variant: LayoutVariant
+) -> dict[str, str]:
+    """Bucket a row's chunks into canonical fields for this layout."""
     buckets: list[list[str]] = [[] for _ in anchors]
     for x, text in row.cells:
         index = bisect_right(anchors, x + _ANCHOR_SLACK) - 1
-        if index < 0:
-            index = 0
-        buckets[index].append(text)
-    return {name: _tidy(" ".join(buckets[i])) for i, name in enumerate(COLUMNS)}
+        buckets[max(index, 0)].append(text)
+
+    fields = dict.fromkeys(COLUMNS, "")
+    extra: dict[str, str] = {}
+    for position, name in enumerate(variant.fields):
+        if name is None or position >= len(buckets):
+            continue
+        value = _tidy(" ".join(buckets[position]))
+        if name in fields:
+            fields[name] = value
+        else:
+            extra[name] = value
+
+    # The 2018-19 layout splits what later became one Reason string into
+    # Category plus Reason. Rejoining them with " - " reproduces the modern
+    # convention exactly; both halves are kept raw alongside it.
+    if extra.get("category") and fields["reason"]:
+        fields["reason"] = f"{extra['category']} - {fields['reason']}"
+    elif extra.get("category"):
+        fields["reason"] = extra["category"]
+    fields.update(extra)
+    return fields
 
 
 def parse_report_rows(
@@ -287,35 +525,43 @@ def parse_report_rows(
 
     anchors: list[float] | None = None
     header_position: int | None = None
+    variant: LayoutVariant | None = None
     for index, row in enumerate(rows):
-        found = header_anchors(row)
+        found = match_header(row)
         if found is not None:
-            anchors, header_position = found, index
+            variant, anchors = found
+            header_position = index
             break
-    if anchors is None or header_position is None:
+    if anchors is None or header_position is None or variant is None:
         raise ReportParseError(f"{source_filename}: header row not found")
 
     report = ParsedReport(
         source_filename=source_filename,
         report_timestamp_et=stamp,
         report_date=stamp.date(),
-        layout_variant=layout_fingerprint(anchors),
+        layout_variant=variant.name,
         column_offsets=tuple(round(a, 1) for a in anchors),
     )
+
+    body = rows[header_position + 1:]
+    owners = _continuation_owners(body, anchors, variant)
+    reason_by_owner = _reason_pieces_by_owner(body, anchors, variant)
 
     current: dict[str, str | None] = {
         "game_date": None, "game_time": None, "matchup": None, "team": None,
     }
-    for row in rows[header_position + 1:]:
+    entry_for_row: dict[int, PlayerEntry] = {}
+    for index, row in enumerate(body):
         line = row.text
-        if _PAGE_MARKER.match(line) or _TIMESTAMP.search(line):
+        if (_PAGE_MARKER.match(line) or _BARE_NUMBER.match(line)
+                or _TIMESTAMP.search(line)):
             continue
         # Pages 2..N repeat neither header nor anything else structural, so a
         # row that looks like a header again is simply skipped.
-        if header_anchors(row) is not None:
+        if match_header(row) is not None:
             continue
 
-        fields = _row_fields(row, anchors)
+        fields = _row_fields(row, anchors, variant)
         if fields["game_date"] and _GAME_DATE.match(fields["game_date"]):
             current["game_date"] = fields["game_date"]
         if fields["game_time"]:
@@ -323,11 +569,19 @@ def parse_report_rows(
         if fields["matchup"] and _MATCHUP.match(fields["matchup"]):
             current["matchup"] = fields["matchup"]
         if fields["team"]:
-            current["team"] = fields["team"]
+            # A long team name wraps onto its own row in the narrower
+            # portrait-era layouts ("Minnesota" then "Timberwolves"). A row
+            # carrying nothing but a team fragment continues the name above it
+            # rather than starting a new block, so appending is what keeps the
+            # following players attached to the right franchise.
+            if _is_bare_team_fragment(fields) and current["team"]:
+                current["team"] = _tidy(f"{current['team']} {fields['team']}")
+            else:
+                current["team"] = fields["team"]
 
         player = _tidy_name(fields["player_name"])
         status = fields["status"]
-        reason = fields["reason"]
+        reason = _rejoin_hyphens(fields["reason"])
 
         # A team that has not filed yet prints the marker with no player. That
         # is a statement about the team, not a wrapped reason for whoever came
@@ -344,15 +598,24 @@ def parse_report_rows(
             continue
 
         if not player:
-            # A continuation row carries only more reason text.
-            if reason and report.entries:
-                report.entries[-1].reason_raw = _tidy(
-                    f"{report.entries[-1].reason_raw} {reason}"
+            # A continuation row carries only more reason text. It belongs to
+            # the player whose row band it falls in -- which is not always the
+            # row above. The reason cell is vertically centred, so a two-line
+            # reason straddles the boundary and its first line can sit higher
+            # than the player name it describes; attaching by position in the
+            # stream silently gives that line to the previous player.
+            # Reason text was already reassembled per player from glyph
+            # positions, so nothing is appended here. Only a stray status-column
+            # fragment with no reason text of its own is folded in.
+            if status and not reason and not reason_by_owner:
+                owner_index = owners.get(index)
+                target = (
+                    entry_for_row.get(owner_index) if owner_index is not None else None
                 )
-            elif status and not reason and report.entries:
-                report.entries[-1].reason_raw = _tidy(
-                    f"{report.entries[-1].reason_raw} {status}"
-                )
+                if target is None and report.entries:
+                    target = report.entries[-1]
+                if target is not None:
+                    target.reason_raw = _tidy(f"{target.reason_raw} {status}").strip()
             continue
 
         if not current["team"]:
@@ -367,20 +630,20 @@ def parse_report_rows(
         normalized = normalize_status(status)
         if status and status.strip().casefold() not in KNOWN_STATUSES:
             report.warnings.append(f"unrecognised status {status!r} for {player!r}")
-        report.entries.append(
-            PlayerEntry(
-                game_date=current["game_date"],
-                game_time_et=current["game_time"],
-                matchup=current["matchup"],
-                away_team=away,
-                home_team=home,
-                team=current["team"],
-                player_name=player,
-                status_raw=status or None,
-                status_normalized=normalized,
-                reason_raw=reason,
-            )
+        entry = PlayerEntry(
+            game_date=current["game_date"],
+            game_time_et=current["game_time"],
+            matchup=current["matchup"],
+            away_team=away,
+            home_team=home,
+            team=current["team"],
+            player_name=player,
+            status_raw=status or None,
+            status_normalized=normalized,
+            reason_raw=reason_by_owner.get(index, reason),
         )
+        report.entries.append(entry)
+        entry_for_row[index] = entry
     return report
 
 

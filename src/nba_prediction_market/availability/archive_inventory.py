@@ -24,8 +24,10 @@ from nba_prediction_market.availability.nba_official import (
     slots_for_date,
 )
 
-#: Slots published per calendar day (every 30 minutes, around the clock).
-SLOTS_PER_DAY: int = 24 * len(SLOT_MINUTES)
+#: Slots per day under the modern half-hourly convention. Kept as the label for
+#: that era only: the expected count is read per date from the slot grid, since
+#: legacy dates publish hourly and the cutover day carries both.
+MODERN_SLOTS_PER_DAY: int = 24 * len(SLOT_MINUTES)
 
 #: A day missing at least this fraction of its slots, while its neighbours are
 #: complete, is more likely a blocked run than a real publication gap.
@@ -38,7 +40,7 @@ class DayCoverage:
 
     report_date: date
     archived: int
-    expected: int = SLOTS_PER_DAY
+    expected: int = MODERN_SLOTS_PER_DAY
     missing_slots: tuple[str, ...] = ()
 
     @property
@@ -186,12 +188,22 @@ def build_inventory(slots: Iterable[ReportSlot]) -> ArchiveInventory:
     per_day: list[DayCoverage] = []
     for day in _daterange(earliest, latest):
         present = by_date.get(day, set())
+        candidates = slots_for_date(day)
         missing = tuple(
-            sorted(s.filename for s in slots_for_date(day) if s.filename not in present)
+            sorted(s.filename for s in candidates if s.filename not in present)
         )
-        per_day.append(DayCoverage(day, archived=len(present), missing_slots=missing))
+        # Expected is per-date, not a constant: hourly before the filename
+        # cutover, half-hourly after, and both on the cutover day itself.
+        per_day.append(
+            DayCoverage(
+                day,
+                archived=len(present),
+                expected=len(candidates),
+                missing_slots=missing,
+            )
+        )
 
-    expected = len(per_day) * SLOTS_PER_DAY
+    expected = sum(d.expected for d in per_day)
     return ArchiveInventory(
         earliest_report=earliest,
         latest_report=latest,

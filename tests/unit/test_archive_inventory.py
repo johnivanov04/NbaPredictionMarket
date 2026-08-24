@@ -5,7 +5,9 @@ from __future__ import annotations
 from datetime import date
 
 from nba_prediction_market.availability.archive_inventory import (
-    SLOTS_PER_DAY,
+    MODERN_SLOTS_PER_DAY as SLOTS_PER_DAY,
+)
+from nba_prediction_market.availability.archive_inventory import (
     build_inventory,
 )
 from nba_prediction_market.availability.nba_official import slots_for_date
@@ -114,3 +116,38 @@ class TestSerialisation:
         import json
 
         json.dumps(payload)
+
+
+class TestEraAwareExpectations:
+    """Expected slots per day follow the publication grid of that date."""
+
+    def test_a_legacy_day_expects_hourly_slots(self):
+        from datetime import date
+
+        from nba_prediction_market.availability.nba_official import slots_for_date
+
+        day = date(2025, 1, 15)
+        inventory = build_inventory(slots_for_date(day))
+        assert inventory.per_day[0].expected == 24
+        assert inventory.per_day[0].is_complete
+        assert inventory.coverage_fraction == 1.0
+
+    def test_the_cutover_day_expects_both_grids(self):
+        from datetime import date
+
+        from nba_prediction_market.availability.nba_official import slots_for_date
+
+        inventory = build_inventory(slots_for_date(date(2025, 12, 22)))
+        assert inventory.per_day[0].expected == 39
+        assert inventory.coverage_fraction == 1.0
+
+    def test_a_full_legacy_day_is_not_reported_as_partial(self):
+        # Counting 48 slots against an hourly day would report every complete
+        # legacy day as half missing.
+        from datetime import date
+
+        from nba_prediction_market.availability.nba_official import slots_for_date
+
+        inventory = build_inventory(slots_for_date(date(2025, 1, 15)))
+        assert inventory.partial_days == 0
+        assert inventory.complete_days == 1

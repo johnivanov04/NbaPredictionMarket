@@ -549,3 +549,153 @@ def test_no_capture_uses_a_report_published_after_its_anchor(tmp_path: Path) -> 
     for result in runner.run(plan_captures(games, ["nba_official_injury_report"])):
         if result.report_timestamp_utc:
             assert result.report_timestamp_utc <= result.task.anchor_utc
+
+
+# --- vertically centred reason cells ---------------------------------------
+
+# The Reason cell is drawn centred in its row while the player name sits on the
+# row baseline, so a wrapped reason straddles the boundary: its first line can
+# be drawn above the player it belongs to. Grouping by y and reading a column
+# welds neighbouring players' reasons together, which is what these lock down.
+
+
+def _reason_piece(y: float, text: str, page: int = 1) -> TextRow:
+    return TextRow(page=page, y=y, cells=((_COLUMN_X["reason"], text),))
+
+
+CENTRED_ROWS = [
+    TIMESTAMP_ROW,
+    HEADER_ROW,
+    # Player A's reason wraps: first line drawn ABOVE his baseline.
+    _reason_piece(130.0, "Injury/Illness - Right Third Metatarsal"),
+    _row(140.0, game_date="12/24/2025", game_time="07:00 (ET)", matchup="MIN@DEN",
+         team="Minnesota Timberwolves", player="Vassell, Devin", status="Out"),
+    _reason_piece(150.0, "Head; Stress Reaction Surgery"),
+    # Player B follows, his own reason likewise straddling his baseline.
+    _reason_piece(168.0, "Injury/Illness - Left Heel; Plantar"),
+    _row(178.0, player="Clarkson, Jordan", status="Questionable"),
+    _reason_piece(188.0, "Fasciitis"),
+    _page_marker(545.4, 1, 1),
+]
+
+
+def test_a_wrapped_reason_drawn_above_its_player_is_not_given_to_the_previous_one():
+    by_name = {e.player_name: e for e in parsed(CENTRED_ROWS).entries}
+    assert by_name["Vassell, Devin"].reason_raw == (
+        "Injury/Illness - Right Third Metatarsal Head; Stress Reaction Surgery"
+    )
+
+
+def test_each_players_reason_stays_whole_and_separate():
+    by_name = {e.player_name: e for e in parsed(CENTRED_ROWS).entries}
+    assert by_name["Clarkson, Jordan"].reason_raw == (
+        "Injury/Illness - Left Heel; Plantar Fasciitis"
+    )
+    # The classic symptom of the old defect was two reasons welded together.
+    assert "Metatarsal" not in by_name["Clarkson, Jordan"].reason_raw
+    assert "Fasciitis" not in by_name["Vassell, Devin"].reason_raw
+
+
+def test_a_not_submitted_marker_is_not_absorbed_into_a_nearby_reason():
+    rows = [
+        *CENTRED_ROWS[:-1],
+        _row(200.0, team="LA Clippers", reason="NOT YET SUBMITTED"),
+        _page_marker(545.4, 1, 1),
+    ]
+    report = parsed(rows)
+    for entry in report.entries:
+        assert "NOT YET SUBMITTED" not in entry.reason_raw
+    assert [n.team for n in report.teams_not_submitted] == ["LA Clippers"]
+
+
+def test_reason_pieces_do_not_cross_a_page_boundary():
+    rows = [
+        TIMESTAMP_ROW,
+        HEADER_ROW,
+        _row(140.0, game_date="12/24/2025", matchup="MIN@DEN",
+             team="Minnesota Timberwolves", player="Vassell, Devin", status="Out"),
+        _reason_piece(150.0, "Head; Stress Reaction"),
+        _page_marker(545.4, 1, 2),
+        # A piece at a similar y on the next page belongs to that page's player.
+        _row(140.0, page=2, player="Clarkson, Jordan", status="Out"),
+        _reason_piece(150.0, "Plantar Fasciitis", page=2),
+        _page_marker(545.4, 2, 2),
+    ]
+    by_name = {e.player_name: e for e in parsed(rows).entries}
+    assert by_name["Vassell, Devin"].reason_raw == "Head; Stress Reaction"
+    assert by_name["Clarkson, Jordan"].reason_raw == "Plantar Fasciitis"
+
+
+def test_a_split_hyphen_in_a_reason_is_rejoined():
+    rows = [
+        TIMESTAMP_ROW, HEADER_ROW,
+        _row(140.0, team="Utah Jazz", player="Preston, Jason", status="Out",
+             reason="G League - Two-"),
+        _reason_piece(150.0, "Way"),
+        _page_marker(545.4, 1, 1),
+    ]
+    assert parsed(rows).entries[0].reason_raw == "G League - Two-Way"
+
+
+def test_the_reports_own_spaced_separator_is_preserved():
+    # " - " with spaces on both sides is the report's separator, not a split
+    # hyphen, and must survive the rejoin.
+    rows = [
+        TIMESTAMP_ROW, HEADER_ROW,
+        _row(140.0, team="Utah Jazz", player="Someone, A", status="Out",
+             reason="Injury/Illness - Left Knee; Soreness"),
+        _page_marker(545.4, 1, 1),
+    ]
+    assert parsed(rows).entries[0].reason_raw == "Injury/Illness - Left Knee; Soreness"
+
+
+def test_parsing_the_same_rows_twice_gives_identical_output() -> None:
+    first = [e.to_dict() for e in parsed(CENTRED_ROWS).entries]
+    second = [e.to_dict() for e in parsed(CENTRED_ROWS).entries]
+    assert first == second
+
+
+# --- page markers drawn in pieces ------------------------------------------
+
+# In the portrait-rotated era the trailing page count sits on its own baseline,
+# so the marker row reads "Page 1 of" and a bare count floats separately. Both
+# land in data columns unless recognised.
+
+
+def test_a_page_marker_without_its_total_is_not_a_player() -> None:
+    rows = [
+        TIMESTAMP_ROW, HEADER_ROW,
+        _row(140.0, team="Utah Jazz", player="Someone, A", status="Out", reason="-"),
+        TextRow(page=1, y=580.0, cells=((400.0, "Page 1 of"),)),
+        TextRow(page=1, y=565.0, cells=((836.0, "1"),)),
+    ]
+    report = parsed(rows)
+    assert [e.player_name for e in report.entries] == ["Someone, A"]
+
+
+def test_a_leading_count_before_the_marker_is_also_recognised() -> None:
+    rows = [
+        TIMESTAMP_ROW, HEADER_ROW,
+        _row(140.0, team="Utah Jazz", player="Someone, A", status="Out", reason="-"),
+        TextRow(page=1, y=580.0, cells=((0.0, "6"), (400.0, "Page 1 of"))),
+    ]
+    assert [e.player_name for e in parsed(rows).entries] == ["Someone, A"]
+
+
+def test_a_detached_page_count_does_not_leak_into_a_reason() -> None:
+    rows = [
+        TIMESTAMP_ROW, HEADER_ROW,
+        _row(140.0, team="Utah Jazz", player="Someone, A", status="Out",
+             reason="Injury/Illness - Knee"),
+        TextRow(page=1, y=565.0, cells=((836.0, "1"),)),
+    ]
+    assert parsed(rows).entries[0].reason_raw == "Injury/Illness - Knee"
+
+
+def test_the_complete_marker_still_works() -> None:
+    rows = [
+        TIMESTAMP_ROW, HEADER_ROW,
+        _row(140.0, team="Utah Jazz", player="Someone, A", status="Out", reason="-"),
+        _page_marker(545.4, 1, 8),
+    ]
+    assert [e.player_name for e in parsed(rows).entries] == ["Someone, A"]

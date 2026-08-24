@@ -187,3 +187,68 @@ class TestAnchorRule:
         assert row["coverage_quality"] == "stale_report"
         assert row["t30_state_available"]
         assert row["report_age_minutes"] == pytest.approx(300.0)
+
+
+class TestPostponedScheduleKeying:
+    """Games are keyed by tipoff, not by the schedule's ``date`` column.
+
+    For a postponed game the source keeps the original ``date`` while moving
+    ``game_datetime_utc`` to the replay. The anchor comes from the tipoff, so
+    keying on ``date`` attaches reports filed for the original occurrence to an
+    anchor months later. One 2021-22 game acquired a report 102 days stale that
+    way before this was fixed.
+    """
+
+    def _games(self):
+        # Mirrors the real record: date says December, tipoff says March.
+        return pd.DataFrame([{
+            "nba_game_id": 473857,
+            "date": "2021-12-19",
+            "game_datetime_utc": pd.Timestamp("2022-03-31 23:30", tz="UTC"),
+            "home_team": "ATL",
+            "away_team": "CLE",
+        }])
+
+    def _events(self, game_date):
+        return pd.DataFrame([{
+            "report_timestamp_utc": pd.Timestamp("2021-12-19 17:00", tz="UTC"),
+            "source_filename": "Injury-Report_2021-12-19_12PM.pdf",
+            "game_date": game_date,
+            "away_team": "CLE",
+            "home_team": "ATL",
+            "team_code": "ATL",
+            "player_name": "Hunter, De'Andre",
+            "balldontlie_player_id": 1,
+            "status_normalized": "out",
+        }])
+
+    def test_a_report_for_the_original_date_does_not_match_the_replayed_game(self):
+        from nba_prediction_market.pipelines.build_availability_salvage import (
+            match_reports_to_games,
+        )
+
+        matched, _ = match_reports_to_games(self._events("12/19/2021"), self._games())
+        assert ("2021-12-19", "CLE", "ATL") not in matched
+
+    def test_a_report_for_the_replay_date_matches(self):
+        from nba_prediction_market.pipelines.build_availability_salvage import (
+            match_reports_to_games,
+        )
+
+        matched, _ = match_reports_to_games(self._events("03/31/2022"), self._games())
+        assert matched[("2022-03-31", "CLE", "ATL")] == 473857
+
+    def test_the_stale_attachment_cannot_recur(self):
+        from nba_prediction_market.pipelines.build_availability_salvage import (
+            build_t30_states,
+            match_reports_to_games,
+        )
+
+        events = self._events("12/19/2021")
+        games = self._games()
+        matched, _ = match_reports_to_games(events, games)
+        t30 = build_t30_states(events, games, matched, set())
+        row = t30.iloc[0]
+        # No state at all is the right answer here, never a 102-day-old one.
+        assert not row["t30_state_available"]
+        assert row["coverage_quality"] == "no_surviving_report"

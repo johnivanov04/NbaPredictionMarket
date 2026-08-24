@@ -2,7 +2,7 @@
 
 Parses every archived report, resolves players and games against the trusted
 Phase 3A0 history, and builds the **true historical T-30 availability state** for
-those 2025-26 games whose reports survive.
+those games whose reports survive.
 
 The defining constraint: a game's state uses only reports where
 ``report_timestamp <= prediction_ts``. If the first surviving report for a game
@@ -25,7 +25,7 @@ import logging
 import re
 import sys
 from collections import Counter, defaultdict
-from datetime import datetime, timedelta
+from datetime import date, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
@@ -33,14 +33,36 @@ import pandas as pd
 
 from nba_prediction_market.availability.archive_inventory import build_inventory
 from nba_prediction_market.availability.identity import PlayerRegistry, unresolved_report
-from nba_prediction_market.availability.nba_official import EASTERN, ReportArchive
+from nba_prediction_market.availability.nba_official import (
+    EASTERN,
+    ReportArchive,
+    slot_from_filename,
+)
 from nba_prediction_market.availability.nba_report_parser import (
     ParsedReport,
     ReportParseError,
     parse_report_pdf,
 )
-from nba_prediction_market.config import ConfigError, Settings, load_settings
+from nba_prediction_market.availability.player_aliases import (
+    KNOWN_UNRESOLVED,
+    VERIFIED_ALIASES,
+    resolve_alias,
+)
+from nba_prediction_market.availability.postponements import (
+    POSTPONEMENTS,
+    REPORT_OMISSIONS,
+    omission_for,
+    postponement_for,
+)
+from nba_prediction_market.config import (
+    ConfigError,
+    Settings,
+    load_settings,
+    season_window,
+)
+from nba_prediction_market.ingestion.game_phase import PHASE_NBA_CUP_CHAMPIONSHIP
 from nba_prediction_market.ingestion.raw_store import utc_now
+from nba_prediction_market.ingestion.season_metadata import SEASON_METADATA
 from nba_prediction_market.matching.team_names import resolve_team
 
 logger = logging.getLogger(__name__)
@@ -52,7 +74,7 @@ _MATCHUP_RE = re.compile(r"^([A-Z]{2,3})@([A-Z]{2,3})$")
 EVENT_COLUMNS: list[str] = [
     "report_timestamp_utc", "report_timestamp_et", "source_filename",
     "game_date", "game_time_et", "matchup", "away_team", "home_team",
-    "team", "team_code", "player_name", "player_name_key",
+    "team", "team_code", "player_name", "player_name_key", "identity_source",
     "balldontlie_player_id", "status_raw", "status_normalized", "reason_raw",
 ]
 
@@ -66,13 +88,25 @@ T30_COLUMNS: list[str] = [
 ]
 
 
-def parse_archive(archive: ReportArchive) -> tuple[list[ParsedReport], list[dict[str, Any]]]:
-    """Parse every archived PDF, keeping failures rather than dropping them."""
+def parse_archive(
+    archive: ReportArchive, *, within: tuple[date, date] | None = None
+) -> tuple[list[ParsedReport], list[dict[str, Any]]]:
+    """Parse archived PDFs, keeping failures rather than dropping them.
+
+    ``within`` restricts parsing to reports whose slot date falls in a window.
+    The archive spans several seasons, and a report only ever describes games
+    close to its own date, so scoping by season both keeps a run fast and stops
+    one season's reports being offered to another season's schedule.
+    """
     parsed: list[ParsedReport] = []
     failures: list[dict[str, Any]] = []
     for path in sorted(archive.root.rglob("Injury-Report_*.pdf")):
         if ".conflict-" in path.name:
             continue
+        if within is not None:
+            slot = slot_from_filename(path.name)
+            if slot is None or not (within[0] <= slot.report_date <= within[1]):
+                continue
         try:
             parsed.append(parse_report_pdf(path))
         except ReportParseError as exc:
@@ -108,6 +142,7 @@ def events_frame(
 
     rows: list[dict[str, Any]] = []
     resolutions = []
+    alias_counts: Counter[str] = Counter()
     for report in reports:
         for entry in report.entries:
             resolution = resolve_team(entry.team)
@@ -115,6 +150,15 @@ def events_frame(
             team_id = team_ids.get(team_code) if team_code else None
             resolved = registry.resolve(entry.player_name, team_id=team_id)
             resolutions.append(resolved)
+            player_id = resolved.balldontlie_player_id
+            # Fall back only to an individually verified alias -- never to a
+            # similarity match. An unlisted mismatch stays unresolved.
+            alias = None
+            if player_id is None:
+                alias = resolve_alias(entry.player_name, team_code)
+                if alias is not None:
+                    player_id = alias.player_id
+                    alias_counts[alias.reason] += 1
             rows.append(
                 {
                     "report_timestamp_utc": report.report_timestamp_utc,
@@ -129,7 +173,12 @@ def events_frame(
                     "team_code": team_code,
                     "player_name": entry.player_name,
                     "player_name_key": normalize_name(entry.player_name),
-                    "balldontlie_player_id": resolved.balldontlie_player_id,
+                    "balldontlie_player_id": player_id,
+                    "identity_source": (
+                        "registry_team_and_name" if resolved.balldontlie_player_id
+                        else alias.reason if alias
+                        else "unresolved"
+                    ),
                     "status_raw": entry.status_raw,
                     "status_normalized": entry.status_normalized,
                     "reason_raw": entry.reason_raw,
@@ -139,16 +188,43 @@ def events_frame(
     frame = frame.sort_values(
         ["report_timestamp_utc", "team_code", "player_name"], kind="stable"
     ).reset_index(drop=True)
-    return frame, unresolved_report(resolutions)
+    # ``unresolved_report`` describes the registry tier alone. Aliases resolve
+    # a further slice, so the headline numbers are recomputed from the frame --
+    # otherwise a row carrying a player id is still counted as unresolved.
+    identity = unresolved_report(resolutions)
+    registry_resolved = int(identity.get("resolved", 0))
+    alias_applied = int(sum(alias_counts.values()))
+    final_resolved = int(frame["balldontlie_player_id"].notna().sum())
+    identity.update(
+        {
+            "resolved_by_registry": registry_resolved,
+            "resolved_by_verified_alias": alias_applied,
+            "verified_alias_resolutions": dict(alias_counts),
+            "resolved": final_resolved,
+            "unresolved": len(frame) - final_resolved,
+            "resolution_rate": (
+                round(final_resolved / len(frame), 6) if len(frame) else None
+            ),
+        }
+    )
+    return frame, identity
 
 
 def match_reports_to_games(
-    events: pd.DataFrame, games: pd.DataFrame
+    events: pd.DataFrame, games: pd.DataFrame, season: int | None = None
 ) -> tuple[dict[tuple[str, str, str], Any], dict[str, Any]]:
     """Map (game_date, away, home) from reports onto trusted game ids."""
+    # Key off the Eastern date of the *tipoff*, not the schedule's ``date``
+    # column. For a postponed game the two disagree -- the source keeps the
+    # original date while moving the tipoff to the replay -- and the anchor is
+    # derived from the tipoff. Keying on ``date`` therefore attaches reports
+    # filed for the original occurrence to an anchor months later; one 2021-22
+    # game picked up a report 102 days stale that way. Fifty-eight games across
+    # 2020-21 to 2022-23 carry this disagreement.
     lookup: dict[tuple[str, str, str], list[Any]] = defaultdict(list)
     for row in games.itertuples():
-        key = (str(row.date), row.away_team, row.home_team)
+        tipoff_et = pd.Timestamp(row.game_datetime_utc).tz_convert(EASTERN)
+        key = (tipoff_et.date().isoformat(), row.away_team, row.home_team)
         lookup[key].append(row.nba_game_id)
 
     matched: dict[tuple[str, str, str], Any] = {}
@@ -174,9 +250,47 @@ def match_reports_to_games(
     # 1,230 regular-season games only, so every playoff and play-in report is
     # expected to miss. Separating those from same-window misses is what makes
     # the count actionable rather than alarming.
-    last_regular_season_date = max(str(row.date) for row in games.itertuples())
+    # The games frame holds the regular season only, so reports either side of
+    # it are expected to miss. Preseason needs the season's own start date --
+    # bounding only from above leaves October exhibition games looking like
+    # unexplained discrepancies, which is what they did before this.
+    last_regular_season_date = max(key[0] for key in lookup)
+    first_regular_season_date = min(key[0] for key in lookup)
+    if season is not None:
+        metadata = SEASON_METADATA.get(season)
+        start = getattr(metadata, "regular_season_start", None) if metadata else None
+        if start is not None:
+            first_regular_season_date = start.isoformat()
+
     after_season = [u for u in unmatched if u["key"][0] > last_regular_season_date]
-    in_window = [u for u in unmatched if u["key"][0] <= last_regular_season_date]
+    before_season = [u for u in unmatched if u["key"][0] < first_regular_season_date]
+    in_window = [
+        u for u in unmatched
+        if first_regular_season_date <= u["key"][0] <= last_regular_season_date
+    ]
+
+    # A postponed occurrence is expected to miss: the report describes a game
+    # that was never played on that date. Classifying these separates a known,
+    # evidenced condition from a genuine unexplained mismatch.
+    # The NBA Cup final is the one Cup game that does not count toward
+    # regular-season records, so it is absent from the 1,230-game frame by
+    # design while still being a real game the reports cover. The date comes
+    # from the season metadata the project already carries.
+    cup_final = None
+    if season is not None:
+        metadata = SEASON_METADATA.get(season)
+        cup_final = getattr(metadata, "nba_cup_final_date", None) if metadata else None
+
+    postponed, cup, unexplained = [], [], []
+    for row in in_window:
+        game_date, away, home = row["key"]
+        known = postponement_for(game_date, away, home)
+        if known is not None:
+            postponed.append({**row, "postponement": known.to_dict()})
+        elif cup_final is not None and game_date == cup_final.isoformat():
+            cup.append({**row, "phase": PHASE_NBA_CUP_CHAMPIONSHIP})
+        else:
+            unexplained.append(row)
     return matched, {
         "report_games": len(report_keys),
         "matched": len(matched),
@@ -184,15 +298,25 @@ def match_reports_to_games(
         "unmatched": len(unmatched),
         "ambiguous_examples": ambiguous[:10],
         "unmatched_breakdown": {
+            "before_regular_season": len(before_season),
             "after_regular_season": len(after_season),
             "within_regular_season_window": len(in_window),
+            "postponed_original_date": len(postponed),
+            "nba_cup_championship": len(cup),
+            "unexplained": len(unexplained),
             "note": (
-                "after_regular_season covers play-in and playoff games, which "
-                "are outside the 1,230-game frame by design. Only the "
-                "within-window keys are genuine source discrepancies."
+                "before_regular_season covers preseason exhibition games and "
+                "after_regular_season covers play-in and playoffs; both are "
+                "outside the 1,230-game frame by design. Postponed "
+                "occurrences are expected to miss: the report describes a date "
+                "the game was not played on, verified against ESPN. The NBA Cup "
+                "final is likewise outside the 1,230-game frame by design. Only "
+                "'unexplained' entries are genuine unresolved discrepancies."
             ),
         },
-        "within_window_unmatched": in_window,
+        "postponed_unmatched": postponed,
+        "cup_championship_unmatched": cup,
+        "unexplained_unmatched": unexplained,
         "unmatched_examples": unmatched[:10],
     }
 
@@ -273,6 +397,16 @@ def build_t30_states(
             "coverage_quality": "no_surviving_report",
         }
         if not observations:
+            # Distinguish "the league never reported this game" from "we hold
+            # no report covering the anchor". The first is a documented gap in
+            # the source; the second is a gap in the archive.
+            game_key = (
+                pd.Timestamp(tipoff).tz_convert(EASTERN).date().isoformat(),
+                game.away_team,
+                game.home_team,
+            )
+            if omission_for(*game_key) is not None:
+                base["coverage_quality"] = "omitted_from_source_reports"
             rows.append(base)
             continue
 
@@ -332,7 +466,9 @@ def build_t30_states(
     return frame
 
 
-def run_pipeline(*, settings: Settings | None = None) -> dict[str, Any]:
+def run_pipeline(
+    *, season: int = 2025, settings: Settings | None = None
+) -> dict[str, Any]:
     settings = settings or load_settings()
     settings.paths.ensure()
     processed = settings.paths.processed
@@ -344,11 +480,11 @@ def run_pipeline(*, settings: Settings | None = None) -> dict[str, Any]:
             raise ConfigError(f"Missing {path}. Run the earlier phases first.")
 
     games = pd.read_parquet(games_path)
-    games = games[(games["modeling_eligible"]) & (games["season"] == 2025)].copy()
+    games = games[(games["modeling_eligible"]) & (games["season"] == season)].copy()
     games["game_datetime_utc"] = pd.to_datetime(games["game_datetime_utc"], utc=True)
 
     players = pd.read_parquet(players_path)
-    players = players[players["season"] == 2025][
+    players = players[players["season"] == season][
         ["player_id", "player_name", "team_id"]
     ].drop_duplicates()
     team_ids = {
@@ -357,21 +493,27 @@ def run_pipeline(*, settings: Settings | None = None) -> dict[str, Any]:
     }
 
     archive = ReportArchive(settings.paths.root / "raw" / "availability" / "nba_official")
-    inventory = build_inventory(archive.archived_slots())
-    reports, failures = parse_archive(archive)
+    window = season_window(season)
+    inventory = build_inventory(
+        [s for s in archive.archived_slots() if window[0] <= s.report_date <= window[1]]
+    )
+    reports, failures = parse_archive(archive, within=window)
     if not reports:
-        raise ConfigError("no parseable reports in the archive; run the archiver first")
+        raise ConfigError(
+            f"no parseable reports archived for season {season}; "
+            "run build_availability_backfill for that window first"
+        )
 
     registry = build_registry(players)
     events, identity = events_frame(reports, registry, team_ids)
-    matched, game_matching = match_reports_to_games(events, games)
+    matched, game_matching = match_reports_to_games(events, games, season)
     not_submitted = not_submitted_index(reports)
     t30 = build_t30_states(events, games, matched, not_submitted)
 
     written: list[Path] = []
     for frame, stem in (
-        (events, "nba_official_availability_events_2025_26"),
-        (t30, "nba_game_availability_t30_partial_2025_26"),
+        (events, f"nba_official_availability_events_{_season_tag(season)}"),
+        (t30, f"nba_game_availability_t30_{_season_tag(season)}"),
     ):
         path = processed / f"{stem}.parquet"
         frame.to_parquet(path, index=False)
@@ -381,6 +523,8 @@ def run_pipeline(*, settings: Settings | None = None) -> dict[str, Any]:
     ages = covered["report_age_minutes"].dropna()
     report = {
         "generated_at_utc": utc_now().isoformat(),
+        "season": season,
+        "season_window": [window[0].isoformat(), window[1].isoformat()],
         "IMPORTANT": (
             "PARTIAL COVERAGE. The NBA CDN retains roughly eight months of "
             "reports, so this covers only the surviving tail of 2025-26 -- never "
@@ -411,10 +555,21 @@ def run_pipeline(*, settings: Settings | None = None) -> dict[str, Any]:
                 "still pending in the report selected for that anchor."
             ),
         },
+        "identity_corrections": {
+            "verified_aliases": [a.to_dict() for a in VERIFIED_ALIASES],
+            "known_unresolved": [u.to_dict() for u in KNOWN_UNRESOLVED],
+            "policy": (
+                "Aliases are individually verified facts, each carrying its "
+                "evidence. There is no similarity-based fallback: an unlisted "
+                "mismatch stays unresolved and is reported."
+            ),
+        },
+        "postponements": [p.to_dict() for p in POSTPONEMENTS],
+        "report_omissions": [o.to_dict() for o in REPORT_OMISSIONS],
         "player_identity": {
             **identity,
             "unresolved_names": _unresolved_names(events),
-            "unresolved_policy": (
+            "unresolved_policy_note": (
                 "Every remaining miss is a nickname or legal-name difference "
                 "(e.g. the report's 'Bub' Carrington against the roster's "
                 "legal name). These are listed rather than fuzzy-matched: "
@@ -425,10 +580,13 @@ def run_pipeline(*, settings: Settings | None = None) -> dict[str, Any]:
         },
         "game_matching": game_matching,
         "t30_coverage": {
-            "regular_season_games_2025_26": len(t30),
+            "regular_season_games": len(t30),
             "with_valid_pre_anchor_state": len(covered),
             "without_surviving_report": int(
                 (t30["coverage_quality"] == "no_surviving_report").sum()
+            ),
+            "omitted_from_source_reports": int(
+                (t30["coverage_quality"] == "omitted_from_source_reports").sum()
             ),
             "first_report_after_anchor": int(
                 (t30["coverage_quality"] == "first_report_after_anchor").sum()
@@ -453,7 +611,10 @@ def run_pipeline(*, settings: Settings | None = None) -> dict[str, Any]:
             "unavailable and never backfilled."
         ),
     }
-    report_path = settings.paths.reports / "nba_official_archive_salvage.json"
+    report_path = (
+        settings.paths.reports
+        / f"nba_official_archive_salvage_{_season_tag(season)}.json"
+    )
     report_path.write_text(json.dumps(report, indent=2, default=str), encoding="utf-8")
     written.append(report_path)
     report["written_files"] = [str(p) for p in written]
@@ -496,6 +657,11 @@ def _offset_drift(reports: list[ParsedReport]) -> dict[str, Any]:
     }
 
 
+def _season_tag(season: int) -> str:
+    """``2025`` -> ``2025_26``, matching the other processed artefacts."""
+    return f"{season}_{(season + 1) % 100:02d}"
+
+
 def _franchise_rows():
     from nba_prediction_market.matching.franchises import FRANCHISES
 
@@ -508,6 +674,10 @@ def build_arg_parser() -> argparse.ArgumentParser:
         description="Phase 3A3B1: parse the surviving archive and build T-30 states.",
     )
     parser.add_argument("--data-dir", default=None)
+    parser.add_argument(
+        "--season", type=int, default=2025,
+        help="Season start year, e.g. 2024 for 2024-25 (default: 2025).",
+    )
     parser.add_argument("--log-level", default="INFO",
                         choices=["DEBUG", "INFO", "WARNING", "ERROR"])
     return parser
@@ -517,7 +687,9 @@ def main(argv: list[str] | None = None) -> int:
     args = build_arg_parser().parse_args(argv)
     logging.basicConfig(level=getattr(logging, args.log_level))
     try:
-        report = run_pipeline(settings=load_settings(args.data_dir))
+        report = run_pipeline(
+            season=args.season, settings=load_settings(args.data_dir)
+        )
     except ConfigError as exc:
         print(f"Configuration error: {exc}", file=sys.stderr)
         return 2
@@ -529,14 +701,18 @@ def main(argv: list[str] | None = None) -> int:
     print(f"  {archive['earliest_report_utc']} .. {archive['latest_report_utc']}")
     print(f"  entries: {archive['total_entries']:,}")
     print()
-    print(f"Player identity: {report['player_identity']['resolved']:,} resolved / "
-          f"{report['player_identity']['total']:,}")
+    ident = report["player_identity"]
+    print(f"Player identity: {ident['resolved']:,} resolved / {ident['total']:,} "
+          f"({100 * ident['resolved'] / max(ident['total'], 1):.2f}%) "
+          f"[registry {ident['resolved_by_registry']:,} + "
+          f"alias {ident['resolved_by_verified_alias']:,}]")
     print(f"Game matching  : {report['game_matching']['matched']} matched, "
           f"{report['game_matching']['ambiguous']} ambiguous, "
           f"{report['game_matching']['unmatched']} unmatched")
     print()
-    print(f"T-30 coverage (PARTIAL): {coverage['with_valid_pre_anchor_state']} of "
-          f"{coverage['regular_season_games_2025_26']} 2025-26 games "
+    tag = f"{report['season']}-{(report['season'] + 1) % 100:02d}"
+    print(f"T-30 coverage: {coverage['with_valid_pre_anchor_state']} of "
+          f"{coverage['regular_season_games']} {tag} games "
           f"({coverage['coverage_pct']}%)")
     age = coverage["report_age_minutes"]
     if age["p50"] is not None:
