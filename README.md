@@ -2159,6 +2159,205 @@ accuracy** (0.6984 vs 0.6911) and **better calibrated** (ECE 0.0275 vs 0.0335).
 The market's edge is in discrimination, which is what a market with access to
 information we do not have should look like.
 
+## Phase 4A0 — execution-aware Kalshi market edge audit
+
+```bash
+python -m nba_prediction_market.pipelines.build_market_edge_audit
+```
+
+**Research only, and exploratory.** Nothing here places an order. 2025-26 was
+inspected repeatedly throughout model development, so no result in this section
+is validation of anything.
+
+**Conclusion: classification A — no evidence our model's disagreement with
+Kalshi is useful.** The evidence is not merely absent; it points the other way.
+
+### There is no earlier season to develop on
+
+Established empirically rather than from documentation. `KXNBAGAME`'s earliest
+event is **2025-04-15**, and **zero events fall before 2025-04-13**, the end of
+the 2024-25 regular season. The 86 events in April-June 2025 are that season's
+play-in and playoffs.
+
+| season | KXNBAGAME regular-season markets |
+| --- | --- |
+| 2022-23 | none |
+| 2023-24 | none |
+| 2024-25 | none (play-in and playoffs only) |
+| 2025-26 | full — 1,230 games with T-30 quotes |
+
+Eight plausible legacy tickers (`NBAGAME`, `NBA`, `NBAWIN`, `NBAWINNER`,
+`PRONBAGAME`, `NBAG`, `NBAMONEYLINE`, `NBAML`) return no events, and
+`KXNBAGAME` is the only game-winner series in Kalshi's catalogue — `KXNBA` is
+championship futures. So market rules cannot be developed on one season and
+evaluated on another. That is why this phase is exploratory by construction.
+
+### Fees, dated and sourced
+
+Not hardcoded from memory. Two dated copies of Kalshi's published schedule were
+retrieved from the Internet Archive, covering the season:
+
+| effective | taker | maker | source |
+| --- | --- | --- | --- |
+| Oct 1, 2025 | `round up(0.07 x C x P x (1-P))` | `round up(0.0175 x C x P x (1-P))` | [archived 2025-10-08](https://web.archive.org/web/20251008232930id_/https://kalshi.com/docs/kalshi-fee-schedule.pdf) |
+| Feb 5, 2026 | `round up(0.07 x C x P x (1-P))` | `round up(0.0175 x C x P x (1-P))` | [archived 2026-02-14](https://web.archive.org/web/20260214014036id_/https://kalshi.com/docs/kalshi-fee-schedule.pdf) |
+
+The schedule *did* change mid-season, which is why the engine is date-effective —
+but the general formulas are identical across both versions. A trade date
+outside every documented window raises rather than falling back to the newest
+schedule.
+
+**KXNBAGAME has no product-specific fee.** Verified on the documents themselves:
+zero mentions of NBA, Basketball, Sports or KXNBAGAME in either version. The only
+product-specific schedules are S&P 500 and Nasdaq-100 index products.
+
+**Rounding is per order, not per contract**, so the per-contract cost falls with
+size. At a 50c price: $0.0200 at 1 contract, $0.0180 at 10, **$0.0175 at 100** —
+where it equals the exact formula. That rounding-stability is why 100 contracts
+is the headline view. It is not a bankroll recommendation.
+
+A floating-point subtlety worth naming: `0.07 x 100 x 0.5 x 0.5` is exactly
+$1.75, but in binary it lands a hair above and ceilings to $1.76. The engine
+uses decimal arithmetic, so fees are not systematically overstated.
+
+### Market quality at T-30
+
+All 1,230 games have usable quotes on both sides. Spreads are 1c on 1,144 games
+and 2c on 86.
+
+| | min | median | max | mean |
+| --- | --- | --- | --- | --- |
+| bid sum | 0.970 | 0.990 | 1.010 | 0.9917 |
+| ask sum | 0.990 | 1.010 | 1.030 | 1.0130 |
+| midpoint sum | 0.980 | 1.000 | 1.020 | 1.0024 |
+
+An ask sum above 1.0 is just the round-trip cost of the spread. **Twelve games
+show a bid sum above 1.0**, which would be a genuine crossed pair; these are
+almost certainly artifacts of aggregating a one-minute candle rather than
+standing arbitrage, and they are reported rather than repaired.
+
+### Who is more right when we disagree?
+
+This is the question that decides the phase, and it is answered before any P&L.
+Bins were declared in advance.
+
+| disagreement (model − market) | games | model p | market p | **actual** | model Brier | market Brier | model − market |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| < −10% | 133 | 0.534 | 0.675 | **0.654** | 0.2074 | 0.1971 | +0.0103 |
+| −10 to −5% | 208 | 0.591 | 0.663 | **0.683** | 0.1984 | 0.1904 | +0.0080 |
+| −5 to −3% | 118 | 0.615 | 0.654 | 0.619 | 0.1906 | 0.1931 | −0.0025 |
+| −3 to −1% | 128 | 0.615 | 0.636 | 0.656 | 0.1822 | 0.1809 | +0.0013 |
+| −1 to +1% | 130 | 0.547 | 0.548 | 0.569 | 0.1728 | 0.1730 | −0.0003 |
+| +1 to +3% | 108 | 0.512 | 0.492 | 0.509 | 0.2086 | 0.2080 | +0.0005 |
+| +3 to +5% | 105 | 0.512 | 0.472 | 0.514 | 0.2092 | 0.2112 | −0.0020 |
+| +5 to +10% | 155 | 0.495 | 0.421 | **0.381** | 0.1978 | 0.1847 | +0.0131 |
+| > +10% | 145 | 0.506 | 0.357 | **0.372** | 0.2360 | 0.2200 | +0.0160 |
+
+Read the two tails. Where the model is *much lower* on the home side than the
+market, the home side won 65.4% — the market said 67.5%, the model said 53.4%.
+Where the model is *much higher*, the home side won 37.2% — the market said
+35.7%, the model said 50.6%. **In both tails the outcome tracks the market.**
+
+And the pattern strengthens with disagreement:
+
+| \|disagreement\| quartile | games | mean \|d\| | model Brier | market Brier | difference | 95% CI |
+| --- | --- | --- | --- | --- | --- | --- |
+| Q1 | 308 | 0.012 | 0.18841 | 0.18907 | −0.00067 | [−0.0021, +0.0007] |
+| Q2 | 307 | 0.038 | 0.19099 | 0.18986 | +0.00112 | [−0.0028, +0.0050] |
+| Q3 | 307 | 0.072 | 0.20141 | 0.19334 | **+0.00806** | [+0.0010, +0.0151] |
+| Q4 | 308 | 0.141 | 0.22075 | 0.20631 | **+0.01444** | [−0.0008, +0.0298] |
+
+The larger the disagreement, the more the market outperforms. That is the exact
+opposite of a tradable signal: when our model departs from the market, the model
+is the one that is wrong. Correlation between disagreement and the market's
+residual is **+0.019** — indistinguishable from none.
+
+### Every predeclared threshold, taker execution, 100 contracts
+
+Threshold = model probability − executable ask − applicable per-contract fee.
+
+| threshold | trades | coverage | hit rate | spent | fees | net P&L | ROI | 95% CI on P&L/trade |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| > 0% | 986 | 80.2% | 36.8% | $37,080 | $1,352 | −$2,132 | −5.75% | [−4.75, +0.41] |
+| ≥ 1% | 860 | 69.9% | 36.5% | $31,780 | $1,182 | −$1,562 | −4.91% | [−4.46, +0.78] |
+| ≥ 2% | 751 | 61.1% | 36.4% | $27,263 | $1,038 | −$1,001 | −3.67% | [−4.13, +1.60] |
+| ≥ 3% | 646 | 52.5% | 34.4% | $23,044 | $892 | −$1,736 | −7.53% | [−5.85, +0.51] |
+| ≥ 5% | 470 | 38.2% | 33.4% | $16,510 | $657 | −$1,467 | −8.88% | [−6.58, +0.32] |
+| ≥ 7.5% | 302 | 24.6% | 34.4% | $10,145 | $424 | −$169 | −1.67% | [−5.13, +3.87] |
+| ≥ 10% | 184 | 15.0% | 37.5% | $6,264 | $262 | **+$374** | **+5.97%** | [−4.06, +7.93] |
+
+Six of seven thresholds lose money. **Every interval spans zero**, including the
+one positive result. The sequence is also non-monotonic (−5.75, −4.91, −3.67,
+−7.53, −8.88, −1.67, +5.97), which is what noise looks like rather than a signal
+strengthening with selectivity.
+
+### The one positive result contradicts itself
+
+The ≥10% threshold deserves a direct look, because it is exactly the number a
+careless reading would seize on.
+
+**All 184 of those trades come from games where |disagreement| > 10%** — the two
+tail bins in the calibration table above. On those same 184 games the model's
+Brier is 0.22980 against the market's 0.21881: **the model is measurably worse
+there than anywhere else**. The trades won 37.5% against a breakeven of 35.5%,
+a two-point margin on 184 bets.
+
+So the only profitable threshold selects precisely the games where our model is
+least accurate, and its profit is a two-point hit-rate margin with an interval
+four times its own width. It is not an edge.
+
+### Diagnostics, all negative
+
+| segment | trades | hit | ROI |
+| --- | --- | --- | --- |
+| combined spread 2c | 885 | 0.358 | −7.10% |
+| combined spread 3c | 86 | 0.453 | +1.10% |
+| combined spread 4c | 15 | 0.467 | +29.93% |
+| volume Q4 (most liquid) | 247 | 0.352 | −12.29% |
+| open interest Q1 | 247 | 0.409 | +3.81% |
+| low availability burden | 326 | 0.334 | −10.84% |
+| high availability burden | 335 | 0.415 | +2.09% |
+| high-minute questionable | 24 | 0.458 | +13.80% |
+| model likes the market favourite more | 147 | 0.626 | −7.40% |
+| model thinks the favourite is overpriced | 426 | 0.268 | −4.58% |
+
+The apparent positives are the small samples — 15 games at a 4c spread, 24 with
+a high-minute questionable player. The "wider spread pays better" pattern runs
+backwards from how execution costs work and is a straightforward small-sample
+artifact. The most liquid quartile is the worst performing.
+
+The availability interaction is the one worth a second look, since availability
+was the largest genuine model improvement: high-burden games return +2.09%
+against −10.84% for low-burden ones. That is directionally consistent with the
+model knowing something extra where availability matters, but on 335 games with
+a hit rate of 0.415 it is far short of evidence, and it is not a result to tune
+on.
+
+### Maker execution does not rescue it
+
+Hypothetical only — a resting order is not a fill, and the candlestick data
+carries no fill evidence. Even so, the arithmetic at the current best bid gives a
+mean net edge of **−0.0010 (home)** and **+0.0023 (away)**. Essentially
+breakeven before any assumption about whether the order would ever trade. **No
+conclusion here depends on maker assumptions.**
+
+### Recommendation
+
+**No candidate strategy is proposed for 2026-27.** The pre-registration slot is
+deliberately left empty: proposing a rule built on the ≥10% threshold would mean
+pre-registering the one region where the model is demonstrably worse than the
+market.
+
+**Multi-anchor Kalshi backfill is not justified yet.** The T-30 result is not
+"our edge decays by tip" — it is "our disagreement is anti-predictive at T-30".
+Earlier anchors would refine the timing of a signal that has not been shown to
+exist. The 2,460 calls should wait for a reason.
+
+The honest summary: the frozen model is a good *forecaster* — better calibrated
+than Kalshi (ECE 0.0275 vs 0.0335) and more accurate (0.6984 vs 0.6911) — and
+still a worse *probability* (Brier 0.20039 vs 0.19465). Where the two disagree,
+the market wins, and it wins by more the louder we disagree.
+
 ## Phase 1 run results (2025-26)
 
 From a live run on 2026-08-19 (`--season 2025`):
@@ -2223,6 +2422,20 @@ Every unmatched record has an identified cause:
   training history for the first development fold, but they are not evidence
   about how good availability features can be, and 2019-20 additionally has 115
   games with no T-30 state at all.
+* **No tradable edge has been demonstrated, and 2025-26 cannot demonstrate one.**
+  Phase 4A0 found the market more accurate wherever the two disagree, and more
+  so as disagreement grows. 2025-26 was inspected throughout model development
+  and Kalshi published no earlier NBA regular-season markets, so there is no
+  clean season on which to develop a market rule and no season on which to
+  validate one. Any future trading claim needs prospective paper trading.
+* **The only profitable edge threshold selects the games the model is worst at.**
+  All 184 trades clearing a 10% net edge come from the >10% disagreement tails,
+  where the model's Brier is 0.2298 against the market's 0.2188. Its interval
+  spans zero and is four times the point estimate.
+* **Slippage and depth are not modelled.** The simulation fills at the quoted
+  ask from a one-minute candle aggregate. There is no order-book data, so real
+  fills at size could be worse; no fictional slippage was invented to cover the
+  gap.
 * **Nonlinear modelling was tested and rejected, and the search was
   deliberately not widened.** Zero of 120 gradient-boosted candidates beat the
   frozen logistic on development folds, so the negative-result rule applied: no
@@ -2327,6 +2540,7 @@ src/nba_prediction_market/
   models/nonlinear.py                gradient-boosted configs, compact fixed grid
   models/nonlinear_bundles.py        Phase 3A4 CORE and EXTENDED allowlists
   models/probability_calibration.py  leakage-safe chronological calibration
+  models/kalshi_fees.py              date-effective Kalshi fee engine
   pipelines/build_dataset.py         Phase 1 CLI entry point
   pipelines/build_pregame_quotes.py  Phase 2 CLI entry point
   pipelines/build_availability_audit.py     Phase 3A3B0 CLI entry point
@@ -2337,4 +2551,5 @@ src/nba_prediction_market/
   pipelines/build_availability_features.py  T-30 availability feature builder
   pipelines/build_availability_model.py     Phase 3A3C CLI entry point
   pipelines/build_nonlinear_model.py        Phase 3A4 CLI entry point
+  pipelines/build_market_edge_audit.py      Phase 4A0 CLI entry point
 ```
