@@ -2580,6 +2580,163 @@ market quotes at each anchor. The one addition worth making is finer-grained
 market capture immediately around report timestamps, which is what made this
 phase's event study possible at all.
 
+## Phase 4A2 — 2026-27 prospective capture hardening
+
+```bash
+python -m nba_prediction_market.pipelines.check_capture_readiness
+python -m nba_prediction_market.pipelines.replay_capture --limit 300
+```
+
+Operational detail lives in [`docs/CAPTURE_OPERATIONS.md`](docs/CAPTURE_OPERATIONS.md).
+
+The goal is not another strategy. It is to make 2026-27 a dataset that can test
+a hypothesis without reconstructing anything afterwards — which is the thing
+2025-26 could never be, having been inspected throughout model development.
+
+**Nothing here trades.** A test walks the capture package's source and fails on
+any mention of order placement, cancellation, portfolio state or Kelly sizing.
+
+### Source time is not availability
+
+Every observation carries two clocks. A report stamped 17:30 says it describes
+the world at 17:30; it does not say we could fetch it then. For prospective
+research a fact may influence our state only from **`first_observed_at_utc`**
+onward, and replay filters on that field rather than on source time.
+
+| field | meaning |
+| --- | --- |
+| `source_timestamp_utc` | what the publisher claims |
+| `http_last_modified_utc` | what the server claims |
+| `request_started_at_utc` / `response_received_at_utc` | our round trip |
+| `first_observed_at_utc` | **when we could actually have acted** |
+| `publication_latency_seconds` | derived: first-observed minus source stamp |
+
+A *negative* publication latency is surfaced rather than clamped to zero: it
+means a clock is wrong, and that is a bug worth seeing, not smoothing.
+
+### Kalshi capabilities, established by probing
+
+| capability | status |
+| --- | --- |
+| WebSocket `orderbook_delta`, `market_ticker` | exists at `wss://api.elections.kalshi.com/trade-api/ws/v2` |
+| WebSocket authentication | **required, even for public market-data channels** |
+| Public REST orderbook, full depth | **works with no credentials** |
+| REST rate limits | token-bucket, 10 tokens per request, 429 with no `Retry-After` |
+
+**This project holds no Kalshi credentials**, so streaming is unavailable and the
+collector polls. That is stated in the readiness output rather than silently
+degraded, and the upgrade path is documented.
+
+Polling the public book is still a real improvement on Phase 4A1, which had only
+one-minute candles. The book gives depth on both sides — but only bids: Kalshi
+returns YES bids and NO bids and no asks at all, because a **NO bid at $0.43 is
+a YES ask at $0.57**. The ask a buyer would actually pay is therefore derived,
+and verified against Kalshi's own `yes_ask_dollars` field on a live market:
+
+```
+derived yes_bid=(0.36, 2000.0)   kalshi yes_bid=0.3600
+derived yes_ask=(0.57, 1210.32)  kalshi yes_ask=0.5700   ->  exact match
+```
+
+Depth counts only levels the exchange returned. An absent level is absent, never
+zero.
+
+### Event-triggered high-resolution capture
+
+The collector runs calm and reacts. Baseline sampling is **60 seconds**; when a
+newly observed report changes a rotation player's status, the affected games drop
+to **5 seconds** for 30 minutes. On a quiet night this costs almost nothing, and
+it gives resolution exactly where Phase 4A1 says the market is imperfect.
+
+Research targets after an event: **0s, 10s, 30s, 1m, 2m, 5m, 10m, 15m, 30m**.
+They are targets, not guarantees — if no quote exists until +42s, the record says
++42s. Nothing is interpolated to hit a target.
+
+Two rules keep this research rather than trading: the trigger is the **report
+change**, never the outcome; and role weight uses only basketball history from
+before the report.
+
+**Every transition is captured, not only the ones that looked profitable** — none
+did, so filtering on them would bake a null result into the collection itself.
+Meaningful role is ≥8 expected minutes, and an *unknown* role counts as
+meaningful: missing a real event costs more than a few extra samples.
+
+### Replay: proving it before trusting it
+
+The archived 2025-26 season is replayed in timestamp order through the same
+event-processing code. Over 300 report timestamps: **1,562 status changes, 1,272
+sampling triggers**, and all three guarantees hold.
+
+| guarantee | result |
+| --- | --- |
+| no future observation is visible at any simulated instant | **pass** |
+| duplicate observations do not double-trigger | **pass** |
+| restarting mid-season does not inflate triggers | **pass** |
+
+Restart-safety is structural, not incidental: an archived report slot is never
+refetched, triggers are deduplicated on the report's own identity, and a
+restarted process re-establishes its baseline from the first report it sees.
+
+One caveat is stated in the replay output rather than buried: the archive
+predates the `first_observed_at` field, so replay substitutes source timestamps
+for observation time. That is optimistic about latency and does not affect the
+ordering guarantees under test.
+
+### Readiness in one command
+
+```
+READINESS: WARN
+
+[  ok  ] clock                    skew 1.3s
+[  ok  ] official_report_source   canary 200; latest slot ... -> 403
+[  ok  ] kalshi_api               6 markets listed; orderbook 200
+[ warn ] nba_schedule             schedule ends 2026-04-13, before today;
+                                  ingest the 2026-27 season before capture begins
+[  ok  ] raw_storage              writable, 112.0 GiB free
+[  ok  ] frozen_model             bundle C C=0.1
+[  ok  ] process_state            no lock held
+```
+
+Every check is a live probe. "The schedule file exists" is not the same claim as
+"the schedule contains tonight's games", and only the second matters at tip-off —
+which is exactly what the one WARN is telling us.
+
+### Failure classification
+
+| severity | meaning |
+| --- | --- |
+| **CRITICAL** | coverage is being lost now and cannot be recovered later — collector stopped, storage unwritable, market feed stale, report canary blocked, game near its anchor with no market identity |
+| **WARNING** | degraded but still capturing — parse failure, unresolved player, individual fetch failure, unusually old report |
+| **INFO** | normal — no upcoming games, markets not yet listed |
+
+Failures become rows. A dataset with unrecorded holes is worse than no dataset,
+because the holes are only discovered when the research depends on them.
+
+### Storage
+
+One captured season is roughly **1.2 GiB** — about 0.6 GiB of report PDFs
+(8,160 at ~80 KB) and 0.6 GiB of market observations (≈2.7M rows). Raw artefacts
+are permanent; derived tables are rebuilt from them. The 2025-26 archive is
+untouched.
+
+### What remains before running continuously
+
+1. **Ingest the 2026-27 schedule.** The only WARN, and a hard blocker: without it
+   there is nothing to anchor capture windows to. Markets already exist — Kalshi
+   has listed KXNBAGAME events for 2026-10-20.
+2. **Resolve market identity per game** ahead of each slate, so a game never
+   reaches its anchor unmapped.
+3. **Optional: obtain Kalshi credentials** to replace polling with
+   `orderbook_delta` streaming. Not required; polling the public book already
+   exceeds what Phase 4A1 had.
+
+### When capture should begin
+
+**At the start of preseason, not opening night.** Preseason games are outside the
+modelling frame, which makes them the right place to discover an operational
+fault — a stale lock, a rate limit, a mapping gap — at zero research cost. By
+2026-10-20 the collector should already have run unattended for a week.
+
 ## Phase 1 run results (2025-26)
 
 From a live run on 2026-08-19 (`--season 2025`):
@@ -2787,4 +2944,10 @@ src/nba_prediction_market/
   pipelines/build_multi_anchor_market.py    Phase 4A1 multi-anchor backfill
   pipelines/build_anchor_models.py          Phase 4A1 anchor models + convergence
   pipelines/build_availability_event_study.py  Phase 4A1 news-reaction event study
+  capture/observation.py             source time vs observation time
+  capture/kalshi_live.py             public orderbook capture, derived asks
+  capture/event_trigger.py           status-change detection + sampling escalation
+  capture/health.py                  collector health and failure severities
+  pipelines/check_capture_readiness.py  preseason readiness command
+  pipelines/replay_capture.py           deterministic replay validator
 ```
