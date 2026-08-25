@@ -1735,6 +1735,212 @@ tree; only source code and provenance metadata are committed.
 Neither third-party dataset is a data dependency. Both are cross-checks against a
 source we can now obtain directly, at finer cadence and with full provenance.
 
+## Phase 3A3C — T-30 player availability
+
+```bash
+python -m nba_prediction_market.pipelines.build_availability_features --cadence native
+python -m nba_prediction_market.pipelines.build_availability_features --cadence harmonized
+python -m nba_prediction_market.pipelines.build_availability_model
+```
+
+The question is not "does availability matter" — of course it does — but whether
+*genuine point-in-time* availability adds anything to a basketball-strength model
+that already carries rotation disruption. Every development fold therefore trains
+two models on **identical examples**: a control with only the frozen Phase 3A3
+features, and an enhanced model adding exactly one availability family.
+
+**It does help, consistently, and it helps where it should.**
+
+### Availability coverage, all seven recovered seasons
+
+| season | games | T-30 | T-1h | T-3h | report age p95 | cadence |
+| --- | --- | --- | --- | --- | --- | --- |
+| 2019-20 | 1,059 | 944 (89.1%) | 944 | 939 | 150 min | 3/day |
+| 2020-21 | 1,080 | 1,079 (99.9%) | 1,078 | 1,068 | 150 min | 3/day |
+| 2021-22 | 1,230 | 1,230 | 1,230 | 1,230 | 30 min | hourly |
+| 2022-23 | 1,230 | 1,230 | 1,230 | 1,230 | 30 min | hourly |
+| 2023-24 | 1,230 | 1,229 | 1,229 | 1,228 | 30 min | hourly |
+| 2024-25 | 1,230 | 1,230 | 1,230 | 1,230 | 30 min | hourly |
+| 2025-26 | 1,230 | 1,230 | 1,230 | 1,230 | 30 min | half-hourly |
+
+117 games have no T-30 state and every one is preserved as
+`availability_coverage = False` with null availability fields, never imputed from
+a neighbour. 115 fall in 2019-20, where the league published only three reports a
+day through a season the pandemic cut in half. One is
+**2023-10-25 BOS@NYK**, the game the source genuinely omitted, and it carries
+`availability_source_omission = True` so it stays distinguishable from an archive
+gap. The 2025-26 holdout has **zero** uncovered games.
+
+The 3-slot seasons are usable but visibly weaker: p95 report age of 150 minutes
+against 30 for every later season. They earn their place as training history for
+the first fold, not as evidence about how good availability features can be.
+
+### What a designation is actually worth
+
+Learned per fold from training seasons only. Fold 2024-25 (training 2019-20 …
+2023-24), 32,598 designations:
+
+| status | n | P(plays) | ± | mean actual min | baseline min | minutes ratio |
+| --- | --- | --- | --- | --- | --- | --- |
+| probable | 1,164 | 0.912 | 0.008 | 23.74 | 17.87 | 1.33 |
+| available | 5,865 | 0.867 | 0.004 | 21.50 | 15.24 | 1.41 |
+| questionable | 2,273 | 0.551 | 0.010 | 14.69 | 17.29 | 0.85 |
+| doubtful | 348 | 0.011 | 0.006 | 0.28 | 15.03 | 0.02 |
+| out | 22,948 | 0.001 | 0.000 | 0.01 | 10.14 | 0.001 |
+
+**Questionable really is a coin flip** (55.1%), doubtful is effectively out
+(1.1%), and out means out (0.1%). The *learned* ordering matches the documented
+one in every fold, which is a check rather than an assumption.
+
+The ratio above 1.0 for available and probable is not an error: the baseline is a
+player's mean minutes over his last ten games *including* games he missed as
+zeros, so a player explicitly listed available is by construction healthier than
+his own trailing average.
+
+Participation is the **target** of this estimation and never a feature of the
+game it came from. A fold's mapping is estimated from that fold's training
+seasons alone, so a validation game cannot inform the mapping applied to itself,
+and 2025-26 informs nothing at all.
+
+### Player role, reusing Phase 3A3
+
+A designation matters in proportion to the player. Role weight is the Phase 3A3
+rotation machinery reused rather than a new player model: shrunk mean minutes
+over the last ten prior games within the season, shrunk by appearances so one
+big night does not make a call-up look like a starter.
+
+A player with no prior history has an **unknown** role, and unknown contributes
+nothing to the minute features rather than being recorded as zero — zero would
+silently assert he does not matter. The count features still record that he was
+designated, so the information is not lost, only kept in the right place.
+
+### Development ablation
+
+Four folds (2021-22 … 2024-25), training on all complete prior
+availability-enabled seasons capped at five. The policy is fixed in advance and
+never searched.
+
+| bundle | adds | mean Brier | vs control | mean log loss | mean AUC |
+| --- | --- | --- | --- | --- | --- |
+| **C** | **role-weighted status minutes** | **0.21297** | **−0.00279** | 0.61393 | 0.7120 |
+| D | training-calibrated expected minutes lost | 0.21347 | −0.00230 | 0.61496 | 0.7102 |
+| E | D + quality-weighted loss | 0.21349 | −0.00227 | 0.61513 | 0.7103 |
+| G | C + late news | 0.21368 | −0.00208 | 0.61551 | 0.7096 |
+| F | D + late news | 0.21382 | −0.00194 | 0.61574 | 0.7092 |
+| B | raw status counts | 0.21446 | −0.00131 | 0.61768 | 0.7086 |
+| A | control (frozen Phase 3A3) | 0.21576 | — | 0.62041 | 0.7033 |
+
+Read down that column and the ordering is the interesting part:
+
+* **Role weighting is what matters.** Raw counts (B) are the weakest family by
+  a wide margin, exactly as a deliberately weak baseline should be. Knowing four
+  players are out is worth far less than knowing whose minutes they were.
+* **The learned calibration did not beat simply splitting by status.** Bundle D
+  compresses five statuses into one number using the fold's own mapping; bundle
+  C keeps them separate and lets the regression weight them. C wins. The
+  calibration is still reported — it is good basketball information — but the
+  model does better with the statuses left apart.
+* **Player quality adds nothing, again.** E ≈ D to four decimal places. Phase
+  3A3 found generic player quality unhelpful; conditioning it on a player
+  actually being missing does not rescue it. Discarded.
+* **Late news adds nothing on top.** F and G are both *worse* than the simple
+  families they extend. Movement between T-3h and T-30 is real — 626 of 1,230
+  holdout games carry a late downgrade — but by T-30 the level already encodes
+  it, so the change term is redundant.
+
+Improvement is consistent across every fold, not driven by one unusual year:
+
+| fold | control Brier | 3A3C Brier | delta | control AUC | 3A3C AUC |
+| --- | --- | --- | --- | --- | --- |
+| 2021-22 | 0.22214 | 0.21828 | −0.00386 | 0.6866 | 0.6981 |
+| 2022-23 | 0.22531 | 0.22216 | −0.00315 | 0.6620 | 0.6751 |
+| 2023-24 | 0.20942 | 0.20743 | −0.00199 | 0.7281 | 0.7320 |
+| 2024-25 | 0.20623 | 0.20400 | −0.00222 | 0.7369 | 0.7427 |
+
+### Frozen configuration
+
+Written before the holdout was scored.
+
+| | |
+| --- | --- |
+| bundle | **C** — Phase 3A3 control + role-weighted status minutes |
+| availability features | `avail_{out,doubtful,questionable,probable}_expected_minutes_diff` |
+| C | 0.1 |
+| training history | most recent 5 complete availability-enabled seasons |
+| player role | shrunk mean minutes, 10-game window, 3-game shrinkage, within season |
+| status calibration | per fold, training seasons only, shrunk toward the pooled ratio |
+| late news | anchors T-3h and T-1h; missing earlier report is unavailable, never "no change" |
+| preprocessing | SimpleImputer → StandardScaler → LogisticRegression, fitted on training only |
+
+Selection rule: lowest mean development Brier; inside a 1e-4 band prefer the
+fewest added features, then the lower Brier, then the smaller C.
+
+### 2025-26 holdout, 1,230 games
+
+| model | Brier | log loss | accuracy | AUC | ECE |
+| --- | --- | --- | --- | --- | --- |
+| Kalshi T-30 normalized | **0.19465** | **0.57013** | 0.6911 | **0.7650** | 0.0335 |
+| **Phase 3A3C native** | **0.20039** | 0.58539 | **0.6984** | 0.7505 | 0.0275 |
+| Phase 3A3C harmonized | 0.20054 | 0.58574 | 0.6967 | 0.7500 | 0.0285 |
+| Phase 3A3 (original) | 0.20369 | 0.59366 | 0.6894 | 0.7419 | 0.0269 |
+| fold-matched control | 0.20380 | 0.59396 | 0.6894 | 0.7416 | 0.0248 |
+| MOV Elo | 0.20440 | 0.59564 | 0.6927 | 0.7400 | 0.0395 |
+| Phase 3A2 | 0.20451 | 0.59552 | 0.6927 | 0.7396 | 0.0337 |
+
+Paired bootstrap, 10,000 resamples, fixed seed. Negative favours 3A3C.
+
+| comparison | Brier difference | 95% CI | verdict |
+| --- | --- | --- | --- |
+| 3A3C native − Phase 3A3 | **−0.00329** | [−0.00595, −0.00068] | **3A3C better** |
+| 3A3C native − matched control | −0.00341 | [−0.00605, −0.00077] | 3A3C better |
+| 3A3C native − Kalshi | +0.00574 | [+0.00131, +0.01010] | Kalshi better |
+| 3A3C harmonized − Phase 3A3 | −0.00314 | [−0.00579, −0.00049] | 3A3C better |
+| 3A3C harmonized − Kalshi | +0.00589 | [+0.00145, +0.01026] | Kalshi better |
+
+The improvement over Phase 3A3 is real and its interval excludes zero, on log
+loss as well as Brier. AUC rises 0.7419 → 0.7505 and accuracy 0.6894 → 0.6984,
+which puts 3A3C **ahead of Kalshi on accuracy** (0.6984 vs 0.6911) while still
+clearly behind on Brier and AUC. Calibration is essentially unchanged
+(ECE 0.0269 → 0.0275).
+
+**36.5% of the Phase 3A3 → Kalshi Brier gap is closed** (0.00330 of 0.00904).
+
+### The cadence shift does not explain the result
+
+Development is hourly-era; the holdout is half-hourly from 2025-12-22, so part of
+it carries fresher information than anything the model trained on. Harmonizing
+the holdout down to the legacy grid moves mean report age from 3.5 to 9.8
+minutes — squarely onto development's 9.6 — and moves Brier by **0.00015**.
+
+| | mean age | p95 | share age 0 | Brier |
+| --- | --- | --- | --- | --- |
+| development | 9.6 min | 30 | 68.1% | — |
+| holdout native | 3.5 min | 30 | 88.6% | 0.20039 |
+| holdout harmonized | 9.8 min | 30 | 67.6% | 0.20054 |
+
+The gain survives harmonization almost intact (−0.00314 vs −0.00329), so it comes
+from knowing *who is unavailable*, not from the holdout being handed fresher
+reports. Report age is **not** used as a model feature; development gave no
+independent reason to add it.
+
+### Where the improvement lives
+
+| segment | games | control Brier | 3A3C Brier | delta |
+| --- | --- | --- | --- | --- |
+| top quartile expected minutes lost | 308 | 0.19202 | 0.18321 | **−0.00881** |
+| late downgrade games | 626 | 0.19781 | 0.19152 | −0.00629 |
+| high-minute OUT player present | 769 | 0.20371 | 0.19849 | −0.00522 |
+| stable-status games | 253 | 0.19513 | 0.19135 | −0.00378 |
+| late upgrade games | 790 | 0.21088 | 0.20850 | −0.00238 |
+| questionable high-minute player | 30 | 0.18741 | 0.18936 | +0.00195 |
+| **no meaningful availability burden** | **78** | **0.20539** | **0.20766** | **+0.00227** |
+
+This is the sanity check that mattered most, and it passes. The gain is
+concentrated where availability should matter — nearly three times the average in
+the top expected-loss quartile — and **disappears where there is nothing to know**,
+turning slightly negative in games with no meaningful burden. A uniform gain would
+have suggested the features were proxying for something else.
+
 ## Phase 1 run results (2025-26)
 
 From a live run on 2026-08-19 (`--season 2025`):
@@ -1793,6 +1999,16 @@ Every unmatched record has an identified cause:
   report before any box score for it, so a season-level registry has him
   elsewhere. Each instance is listed with evidence; a date-aware roster is the
   durable fix and is not yet built.
+* **The 2019-20 and 2020-21 availability features are materially staler than
+  every later season.** Those seasons published three reports a day, giving a p95
+  report age of 150 minutes against 30 from 2021-22 onward. They are usable as
+  training history for the first development fold, but they are not evidence
+  about how good availability features can be, and 2019-20 additionally has 115
+  games with no T-30 state at all.
+* **Late-news features are built and tested but not used.** Movement between
+  T-3h and T-30 is real, yet adding it made development performance worse: by
+  T-30 the level already encodes the movement. The machinery stays because
+  T-15m/T-5m research may want it, but nothing in the frozen model consumes it.
 * **Availability rows for postponed occurrences are withheld, not remapped.**
   They describe a game that did not happen — two of the four were replayed weeks
   later — so they are never attached to the replayed game.
@@ -1880,6 +2096,10 @@ src/nba_prediction_market/
   availability/player_aliases.py     verified identity corrections, no fuzzy fallback
   availability/postponements.py      postponed games, evidenced against ESPN
   availability/external_sources.py   third-party archives on one normalized schema
+  availability/reason_categories.py  broad deterministic reason buckets (diagnostic)
+  features/availability_features.py  role-weighted T-30 availability aggregates
+  models/status_calibration.py       what each designation predicts, per fold
+  models/availability_bundles.py     Phase 3A3C ablation bundles
   pipelines/build_dataset.py         Phase 1 CLI entry point
   pipelines/build_pregame_quotes.py  Phase 2 CLI entry point
   pipelines/build_availability_audit.py     Phase 3A3B0 CLI entry point
@@ -1887,4 +2107,6 @@ src/nba_prediction_market/
   pipelines/run_availability_capture.py     prospective capture CLI
   pipelines/build_availability_backfill.py  Phase 3A3B2 historical backfill CLI
   pipelines/build_availability_coverage.py  season/source coverage matrix
+  pipelines/build_availability_features.py  T-30 availability feature builder
+  pipelines/build_availability_model.py     Phase 3A3C CLI entry point
 ```
