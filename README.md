@@ -2358,6 +2358,228 @@ than Kalshi (ECE 0.0275 vs 0.0335) and more accurate (0.6984 vs 0.6911) — and
 still a worse *probability* (Brier 0.20039 vs 0.19465). Where the two disagree,
 the market wins, and it wins by more the louder we disagree.
 
+## Phase 4A1 — multi-anchor convergence and availability news reaction
+
+```bash
+python -m nba_prediction_market.pipelines.build_multi_anchor_market
+python -m nba_prediction_market.pipelines.build_anchor_models
+python -m nba_prediction_market.pipelines.build_availability_event_study
+```
+
+**Research only, and exploratory.** Nothing here trades.
+
+Phase 4A0 showed no tradable disagreement at T-30. That was a statement about
+one instant. This phase asks whether the market is less efficient *earlier*,
+when the injury picture is incomplete — and whether it prices official NBA
+availability news slowly enough to matter.
+
+**Classification: C.** There is real, measurable evidence that Kalshi does *not*
+absorb official injury news instantaneously. It is also economically useless:
+the entire adjustment is smaller than the bid-ask spread.
+
+### The backfill
+
+2,460 markets, one request each, covering a six-hour window ending at T-30:
+**784,156 candles, zero failures.** The cache slug is `t30_lb360_p1`, so Phase
+2's `t30_lb60_p1` is untouched.
+
+| anchor | markets | usable | games with both sides | quote age p95 |
+| --- | --- | --- | --- | --- |
+| T-6h | 2,460 | 2,313 | **1,103** | 0s |
+| T-3h | 2,460 | 2,460 | 1,230 | 0s |
+| T-1h | 2,460 | 2,460 | 1,230 | 0s |
+| T-30m | 2,460 | 2,460 | 1,230 | 0s |
+
+T-6h is the one incomplete anchor — 127 games had no two-sided market six hours
+before tip, because the market had not opened yet. That is itself worth knowing:
+the earliest anchor is partly unavailable, not merely less informative.
+
+T-15m and T-5m are **structurally absent**: the fetched window ends at T-30, so
+they were never retrieved. Their exclusion is a property of the data, not of
+discipline.
+
+### The market leads at every anchor, by a near-constant margin
+
+Each anchor model is the frozen Phase 3A3C bundle-C specification refitted on
+information available at that anchor. No new feature families, same history
+policy, same small C grid chosen on development folds only. All four were frozen
+before the market was consulted. Every anchor selected C = 0.1.
+
+The T-30 anchor model reproduces the frozen Phase 3A3C predictions **exactly**
+(max |difference| = 0.0 over 1,230 games), which is the check that the anchor
+machinery is doing what it claims.
+
+| anchor | games | model Brier | market Brier | difference | 95% CI | model AUC | market AUC |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| T-6h | 1,103 | 0.20678 | 0.20001 | +0.00677 | [+0.0020, +0.0114] | 0.7338 | 0.7528 |
+| T-3h | 1,230 | 0.20107 | 0.19547 | +0.00560 | [+0.0012, +0.0100] | 0.7485 | 0.7627 |
+| T-1h | 1,230 | 0.20099 | 0.19488 | +0.00611 | [+0.0018, +0.0104] | 0.7488 | 0.7643 |
+| T-30m | 1,230 | 0.20039 | 0.19465 | +0.00574 | [+0.0014, +0.0101] | 0.7505 | 0.7650 |
+
+**The market wins at every anchor and every interval excludes zero.** The margin
+does not shrink earlier in the day — if anything T-6h is the worst anchor for us.
+Both sides sharpen toward tip in lockstep; the market's lead is stable.
+
+The familiar pattern holds throughout: our model is **better calibrated** at
+every anchor (ECE 0.019-0.028 against 0.025-0.034) and more accurate at three of
+four, while still being the worse probability.
+
+### The gap does not converge
+
+| anchor | games | mean \|gap\| | median \|gap\| |
+| --- | --- | --- | --- |
+| T-6h | 1,103 | 0.0679 | 0.0556 |
+| T-3h | 1,230 | 0.0669 | 0.0549 |
+| T-1h | 1,230 | 0.0659 | 0.0535 |
+| T-30m | 1,230 | 0.0659 | 0.0533 |
+
+Six hours of price discovery and new injury reports move the average
+disagreement by **0.002**. Between consecutive anchors the gap shrinks about
+half the time and expands about half the time — a coin flip.
+
+| transition | games | gap shrank | expanded | sign flip | mean model move | mean market move |
+| --- | --- | --- | --- | --- | --- | --- |
+| T-6h → T-3h | 1,103 | 48.4% | 569 | 79 | 0.0128 | 0.0096 |
+| T-3h → T-1h | 1,230 | 54.1% | 565 | 90 | 0.0139 | 0.0092 |
+| T-1h → T-30m | 1,230 | 49.0% | 627 | 52 | 0.0081 | 0.0052 |
+
+Our probability moves **more** than the market's at every step — new availability
+information genuinely arrives — and yet the gap does not close. The model's
+movement is not toward the market. That is the signature of two forecasts that
+differ in content rather than in timeliness.
+
+### Executable edge, every anchor, every predeclared threshold
+
+Same thresholds as Phase 4A0, not re-chosen per anchor. Taker at the ask,
+date-effective fees, 100 contracts.
+
+**26 of 28 anchor-threshold combinations lose money.**
+
+| threshold | T-6h | T-3h | T-1h | T-30m |
+| --- | --- | --- | --- | --- |
+| > 0% | −4.28% | −4.73% | −4.85% | −5.75% |
+| ≥ 1% | −2.64% | −5.39% | −4.75% | −4.91% |
+| ≥ 2% | −4.17% | −5.37% | −4.53% | −3.67% |
+| ≥ 3% | −2.66% | −4.66% | −9.10% | −7.53% |
+| ≥ 5% | −4.01% | −6.81% | −9.83% | −8.88% |
+| ≥ 7.5% | −9.54% | −2.88% | −2.17% | −1.67% |
+| ≥ 10% | **−7.67%** | +8.06% | +7.12% | +5.97% |
+
+The two survivors are the ≥10% threshold at T-3h and T-1h, and both intervals
+span zero ([−3.46, +8.86] and [−4.05, +9.27] per trade). More telling: **at T-6h
+— the earliest anchor, where an unpriced-news story would be strongest — that
+same threshold loses 7.67%.** The one threshold that looks profitable is the one
+that fails precisely where the hypothesis predicts it should work best.
+
+**No earlier anchor is more promising than T-30.**
+
+### Does Kalshi price official injury news immediately? No — but it does not matter
+
+This is what the report archive makes uniquely answerable. An event is a change
+between consecutive official reports for the same player and game, timestamped
+by the league. Participation never defines an event.
+
+**2,705 events in the six-hour window; 2,543 with usable market observations.**
+
+| | |
+| --- | --- |
+| downgrades / upgrades | 1,393 / 1,150 |
+| role bands (high / medium / low / unknown) | 711 / 898 / 656 / 278 |
+| commonest transitions | questionable→available (1,055), questionable→out (885), doubtful→out (455) |
+| median pre-quote latency | 60s |
+| median post-quote latency | **0s** |
+
+Moves are signed toward the direction the news implies. Events that move the
+other way are kept, not discarded.
+
+**All 2,543 events:**
+
+| horizon | n | mean move | share > 0 | 95% CI |
+| --- | --- | --- | --- | --- |
+| immediate | 2,543 | +0.00015 | 4.1% | [−0.00001, +0.00039] |
+| +5 min | 2,543 | +0.00127 | 13.3% | [+0.00082, +0.00178] |
+| +15 min | 1,817 | +0.00202 | 23.5% | [+0.00133, +0.00281] |
+| +30 min | 1,810 | +0.00221 | 27.5% | [+0.00146, +0.00304] |
+| +60 min | 1,009 | +0.00265 | 34.1% | [+0.00132, +0.00405] |
+
+**High-role events only (711 events, ≥20 expected minutes):**
+
+| horizon | n | games | mean move | 95% CI |
+| --- | --- | --- | --- | --- |
+| immediate | 711 | 491 | +0.00027 | [−0.00005, +0.00070] |
+| +5 min | 711 | 491 | +0.00290 | [+0.00160, +0.00446] |
+| +15 min | 489 | 358 | +0.00469 | [+0.00267, +0.00725] |
+| +30 min | 487 | 356 | **+0.00562** | [+0.00373, +0.00786] |
+| +60 min | 265 | 205 | +0.00660 | [+0.00306, +0.01095] |
+
+The immediate interval **includes zero at both scopes**. The market does not jump
+on the report stamp. Reaction speed, on events with a move large enough for a
+ratio to be meaningful:
+
+| fraction of the 30-minute move present by | median | mean |
+| --- | --- | --- |
+| immediately | 0.00 | 0.06 |
+| +5 min | 0.00 | 0.40 |
+| +15 min | 1.00 | 0.65 |
+
+**So adjustment is genuinely gradual — roughly 5 to 15 minutes.** That is a real
+market-microstructure finding and it contradicts a naive efficient-market story.
+
+And it is economically worthless. The entire 30-minute reaction to a **high-role**
+availability change is **0.0056** — against a median spread of **0.01**. Capturing
+the whole adjustment, perfectly, with no fee and no latency, would recover about
+half the round-trip cost of the spread. The spread does not widen defensively
+either: unchanged in 2,428 of 2,543 events, wider in only 62.
+
+A midpoint that drifts half a cent over a quarter of an hour is not a trade.
+
+### One genuinely interesting result
+
+The availability-burden diagnostic, run at every anchor, on model-minus-market
+Brier (negative = our model better):
+
+| anchor | low burden (Q1) | mid | high burden (Q4) |
+| --- | --- | --- | --- |
+| T-6h | +0.00712 | +0.00566 | +0.00851 |
+| T-3h | +0.00599 | +0.00719 | +0.00202 |
+| T-1h | +0.00104 | +0.01119 | +0.00104 |
+| T-30m | +0.00408 | +0.00949 | **−0.00007** |
+
+In high-burden games the gap closes monotonically as tip approaches — +0.0085,
++0.0020, +0.0010, −0.0001 — until at T-30 the model **exactly ties the market**.
+That is the one cell in the entire phase where we are not behind, and it is
+where availability information is most complete and most decisive.
+
+It explains Phase 4A0's weak +2.09% hint without vindicating it. Our availability
+work buys back precisely enough to match the market where availability dominates,
+and not a basis point more. A tie is not an edge, and this one arrives at T-30 —
+not earlier, which is what the phase set out to test.
+
+### No strategy is proposed
+
+Phase 4A0 declined to pre-register a rule. Phase 4A1 declines again, for a
+sharper reason: the slow-adjustment finding is real but sub-spread, and the only
+profitable threshold fails at the anchor where its own hypothesis is strongest.
+
+**Prospective 2026-27 discovery/validation protocol.** Since no historical
+strategy exists, the split must be declared before any 2026-27 outcome is seen:
+
+* **Discovery** — games through **2026-12-31**. Capture only. Any hypothesis must
+  be written down, with its threshold and anchor, before the period closes.
+* **Freeze** — 2027-01-01. The hypothesis file is committed and not edited.
+* **Validation** — games from **2027-01-01** to the end of the regular season.
+  These games score the frozen hypothesis and are never used to form one.
+
+The two periods share no games. If discovery produces nothing worth freezing,
+validation scores nothing — which is a legitimate outcome, not a failure to be
+worked around.
+
+The prospective collector already preserves what this needs: every official
+report snapshot with its exact timestamp, the normalized availability state, and
+market quotes at each anchor. The one addition worth making is finer-grained
+market capture immediately around report timestamps, which is what made this
+phase's event study possible at all.
+
 ## Phase 1 run results (2025-26)
 
 From a live run on 2026-08-19 (`--season 2025`):
@@ -2422,6 +2644,16 @@ Every unmatched record has an identified cause:
   training history for the first development fold, but they are not evidence
   about how good availability features can be, and 2019-20 additionally has 115
   games with no T-30 state at all.
+* **Kalshi absorbs official injury news gradually, not instantly — and it does
+  not matter.** The immediate reaction is statistically zero; adjustment takes
+  5-15 minutes. But the entire 30-minute move for a high-role status change is
+  0.0056 against a 1-cent spread, so capturing all of it perfectly would recover
+  about half the round-trip cost. A real microstructure finding with no
+  economic content.
+* **No earlier anchor is better than T-30.** The market leads at T-6h, T-3h,
+  T-1h and T-30m alike, every interval excluding zero, and the disagreement gap
+  barely converges (0.0679 to 0.0659 over six hours). At T-6h even the one
+  otherwise-profitable threshold loses 7.67%.
 * **No tradable edge has been demonstrated, and 2025-26 cannot demonstrate one.**
   Phase 4A0 found the market more accurate wherever the two disagree, and more
   so as disagreement grows. 2025-26 was inspected throughout model development
@@ -2552,4 +2784,7 @@ src/nba_prediction_market/
   pipelines/build_availability_model.py     Phase 3A3C CLI entry point
   pipelines/build_nonlinear_model.py        Phase 3A4 CLI entry point
   pipelines/build_market_edge_audit.py      Phase 4A0 CLI entry point
+  pipelines/build_multi_anchor_market.py    Phase 4A1 multi-anchor backfill
+  pipelines/build_anchor_models.py          Phase 4A1 anchor models + convergence
+  pipelines/build_availability_event_study.py  Phase 4A1 news-reaction event study
 ```

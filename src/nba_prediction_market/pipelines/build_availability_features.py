@@ -48,9 +48,12 @@ logger = logging.getLogger(__name__)
 #: by instruction: its coverage is partial and its cadence only three a day.
 AVAILABILITY_SEASONS: tuple[int, ...] = (2019, 2020, 2021, 2022, 2023, 2024, 2025)
 
-#: Anchors, in minutes before tipoff. T-30 is the prediction anchor; the two
-#: earlier ones exist only to measure movement *into* it.
+#: Anchors, in minutes before tipoff. T-30 is the prediction anchor; the
+#: earlier ones exist to measure movement *into* it.
 ANCHORS: dict[str, int] = {"t30": 30, "t1h": 60, "t3h": 180}
+#: Phase 4A1 studies each anchor as a decision point in its own right, which
+#: needs one more. Kept separate so the Phase 3A3C artifact is unchanged.
+MULTI_ANCHORS: dict[str, int] = {"t30": 30, "t1h": 60, "t3h": 180, "t6h": 360}
 PREDICTION_ANCHOR = "t30"
 
 SIDES = ("home", "away")
@@ -103,7 +106,9 @@ def restrict_to_legacy_cadence(events: pd.DataFrame) -> pd.DataFrame:
 
 
 def game_states(
-    events: pd.DataFrame, games: pd.DataFrame
+    events: pd.DataFrame,
+    games: pd.DataFrame,
+    anchors: dict[str, int] | None = None,
 ) -> dict[Any, dict[str, dict[str, dict[Any, str]]]]:
     """``game_id -> anchor -> team_code -> {player_id: status}``.
 
@@ -134,7 +139,7 @@ def game_states(
         if not rows:
             continue
         per_anchor: dict[str, dict[str, dict[Any, str]]] = {}
-        for anchor, minutes in ANCHORS.items():
+        for anchor, minutes in (anchors or ANCHORS).items():
             cutoff = tipoff - timedelta(minutes=minutes)
             eligible = [r for r in rows if r.report_timestamp_utc <= cutoff]
             if not eligible:
@@ -195,6 +200,7 @@ def build_rows(
     states: dict[Any, dict[str, dict[str, dict[Any, str]]]],
     minutes_by_game: dict[Any, dict[Any, dict[Any, float]]],
     plusminus_by_game: dict[Any, dict[Any, dict[Any, float]]],
+    anchors: dict[str, int] | None = None,
 ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
     """Feature rows plus per-player observations, both leakage-safe.
 
@@ -227,7 +233,7 @@ def build_rows(
         }
 
         anchor_players: dict[str, dict[str, list[ReportedPlayer]]] = {}
-        for anchor in ANCHORS:
+        for anchor in (anchors or ANCHORS):
             state = per_anchor.get(anchor)
             covered = state is not None
             row[f"avail_{anchor}_covered"] = covered
@@ -251,7 +257,7 @@ def build_rows(
 
         # Late news: movement from each earlier anchor into T-30.
         t30 = anchor_players.get(PREDICTION_ANCHOR)
-        for anchor in ("t3h", "t1h"):
+        for anchor in [a for a in (anchors or ANCHORS) if a != PREDICTION_ANCHOR]:
             earlier = anchor_players.get(anchor)
             for side in SIDES:
                 prefix = f"avail_{side}_{anchor}_to_t30"
@@ -332,7 +338,11 @@ def player_minutes_index(
 
 
 def run_pipeline(
-    *, settings: Settings | None = None, cadence: str = "native"
+    *,
+    settings: Settings | None = None,
+    cadence: str = "native",
+    anchors: dict[str, int] | None = None,
+    output_suffix: str = "",
 ) -> dict[str, Any]:
     settings = settings or load_settings()
     settings.paths.ensure()
@@ -372,7 +382,7 @@ def run_pipeline(
             continue
         if cadence == "harmonized":
             events = restrict_to_legacy_cadence(events)
-        found = game_states(events, season_games)
+        found = game_states(events, season_games, anchors)
         states.update(found)
         reason_tables[season] = frequency_table(events["reason_raw"].tolist())
         per_season.append(
@@ -386,9 +396,11 @@ def run_pipeline(
         logger.info("season %s: %d games, %d with reports", season,
                     len(season_games), len(found))
 
-    rows, observations = build_rows(games, states, minutes_by_game, plus_by_game)
+    rows, observations = build_rows(
+        games, states, minutes_by_game, plus_by_game, anchors
+    )
     frame = pd.DataFrame(rows)
-    suffix = "" if cadence == "native" else f"_{cadence}"
+    suffix = ("" if cadence == "native" else f"_{cadence}") + output_suffix
     path = processed / f"nba_game_availability_features_2019_26{suffix}.parquet"
     frame.to_parquet(path, index=False)
 
@@ -403,6 +415,8 @@ def run_pipeline(
         entry["t30_covered"] = int(season_rows["availability_coverage"].sum())
         entry["t1h_covered"] = int(season_rows["avail_t1h_covered"].sum())
         entry["t3h_covered"] = int(season_rows["avail_t3h_covered"].sum())
+        if "avail_t6h_covered" in season_rows.columns:
+            entry["t6h_covered"] = int(season_rows["avail_t6h_covered"].sum())
         ages = season_rows["avail_report_age_minutes"].dropna()
         entry["report_age_minutes"] = (
             {
@@ -429,7 +443,7 @@ def run_pipeline(
         },
         "rows": len(frame),
         "columns": len(frame.columns),
-        "anchors_built": sorted(ANCHORS),
+        "anchors_built": sorted(anchors or ANCHORS),
         "anchors_excluded": ["t15m", "t5m"],
         "anchors_excluded_reason": (
             "both fall after the T-30 prediction anchor and could not be model "
