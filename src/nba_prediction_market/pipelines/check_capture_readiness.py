@@ -143,27 +143,45 @@ def check_kalshi() -> Check:
 
 
 def check_schedule(settings: Settings) -> Check:
-    """The schedule loads and we can name the games in the horizon."""
-    path = settings.paths.processed / "nba_regular_season_games_2006_26.parquet"
+    """The forward schedule loads and reaches beyond today.
+
+    Checks the *forward* schedule the collector captures against, not the
+    frozen historical frame. A schedule that stops before today means the
+    collector has nothing to anchor capture windows to.
+    """
+    path = settings.paths.processed / "nba_forward_schedule_2026_27.parquet"
     if not path.is_file():
-        return Check("nba_schedule", CRITICAL, f"missing {path}")
+        return Check("nba_schedule", CRITICAL,
+                     "no forward schedule; run build_forward_schedule")
     try:
-        games = pd.read_parquet(path, columns=["game_datetime_utc", "season"])
+        games = pd.read_parquet(
+            path, columns=["tipoff_utc", "phase", "counts_toward_research"]
+        )
     except Exception as exc:
         return Check("nba_schedule", CRITICAL, f"unreadable: {type(exc).__name__}")
-    tipoff = pd.to_datetime(games["game_datetime_utc"], utc=True)
+
+    tipoff = pd.to_datetime(games["tipoff_utc"], utc=True)
     now = pd.Timestamp(utc_now())
-    upcoming = int(
-        ((tipoff >= now) & (tipoff <= now + pd.Timedelta(hours=SLATE_HORIZON_HOURS))).sum()
-    )
     latest = tipoff.max()
     if latest < now:
-        return Check("nba_schedule", WARNING,
-                     f"schedule ends {latest.date()}, before today; ingest the "
-                     "2026-27 season before capture begins",
+        return Check("nba_schedule", CRITICAL,
+                     f"forward schedule ends {latest.date()}, before today",
                      {"latest_scheduled": str(latest.date())})
-    return _ok("nba_schedule", f"{upcoming} game(s) in the next "
-               f"{SLATE_HORIZON_HOURS:.0f}h", upcoming_games=upcoming)
+
+    future = int((tipoff >= now).sum())
+    soon = int(
+        ((tipoff >= now)
+         & (tipoff <= now + pd.Timedelta(hours=SLATE_HORIZON_HOURS))).sum()
+    )
+    preseason = int((games["phase"] == "preseason").sum())
+    regular = int(games["counts_toward_research"].sum())
+    return _ok(
+        "nba_schedule",
+        f"{future} future game(s) to {latest.date()}; {soon} in the next "
+        f"{SLATE_HORIZON_HOURS:.0f}h ({regular} regular, {preseason} preseason)",
+        future_games=future, next_slate=soon,
+        regular_season=regular, preseason=preseason,
+    )
 
 
 def check_storage(settings: Settings) -> Check:
@@ -223,7 +241,9 @@ def check_locks(settings: Settings) -> Check:
         return Check("process_state", INFO,
                      f"collector already running (pid {pid}, heartbeat {age:.0f}s ago)")
     return Check("process_state", WARNING,
-                 f"stale lock from dead pid {pid}; remove {lock} before starting")
+                 f"stale lock from dead pid {pid}: the collector died without "
+                 f"releasing it. Starting the collector clears it automatically; "
+                 f"the warning stands because a crash is worth noticing.")
 
 
 def run_checks(settings: Settings | None = None) -> dict[str, Any]:

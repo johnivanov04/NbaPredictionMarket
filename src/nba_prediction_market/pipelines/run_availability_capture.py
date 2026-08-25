@@ -30,7 +30,6 @@ from pathlib import Path
 from typing import Any
 
 import httpx
-import pandas as pd
 
 from nba_prediction_market.availability.capture_schedule import plan_captures
 from nba_prediction_market.availability.nba_official import (
@@ -100,22 +99,29 @@ def canary_is_reachable(client: httpx.Client, filename: str = CANARY_FILENAME) -
 def upcoming_games(
     settings: Settings, *, now: datetime, horizon_hours: float
 ) -> list[dict[str, Any]]:
-    """Games tipping inside the horizon, from the trusted schedule."""
-    path = settings.paths.processed / "nba_regular_season_games_2006_26.parquet"
-    if not path.is_file():
-        raise ConfigError(f"Missing {path}. Run the earlier phases first.")
-    games = pd.read_parquet(path)
-    tipoff = pd.to_datetime(games["game_datetime_utc"], utc=True)
-    window = (tipoff >= pd.Timestamp(now)) & (
-        tipoff <= pd.Timestamp(now + timedelta(hours=horizon_hours))
+    """Games tipping inside the horizon, from the forward schedule.
+
+    Reads the forward schedule, not the frozen historical frame. The
+    historical frame ends with the 2025-26 season, so every game in it is in
+    the past and this function would return an empty slate for ever -- quietly,
+    because "no games tonight" is a perfectly ordinary answer.
+    """
+    from nba_prediction_market.pipelines.build_forward_schedule import (
+        SCHEDULE_FILE,
+        load_stored,
     )
-    selected = games[window]
+
+    games = load_stored(settings)
+    if not games:
+        raise ConfigError(
+            f"Missing or empty {settings.paths.processed / SCHEDULE_FILE}. "
+            "Run build_forward_schedule first."
+        )
+    limit = now + timedelta(hours=horizon_hours)
     return [
-        {
-            "game_id": row.nba_game_id,
-            "scheduled_tipoff_utc": pd.Timestamp(row.game_datetime_utc).to_pydatetime(),
-        }
-        for row in selected.itertuples()
+        {"game_id": g.source_game_id, "scheduled_tipoff_utc": g.tipoff_utc}
+        for g in sorted(games, key=lambda g: g.tipoff_utc)
+        if g.is_capturable and now <= g.tipoff_utc <= limit
     ]
 
 

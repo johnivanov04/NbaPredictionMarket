@@ -101,11 +101,20 @@ class TestHorizon:
 
         processed = tmp_path / "processed"
         processed.mkdir()
+        # The forward schedule, not the frozen historical frame: every game in
+        # that frame is now in the past, so reading it returns an empty slate.
         pd.DataFrame([
-            {"nba_game_id": 1, "game_datetime_utc": NOW + timedelta(hours=2)},
-            {"nba_game_id": 2, "game_datetime_utc": NOW + timedelta(hours=100)},
-            {"nba_game_id": 3, "game_datetime_utc": NOW - timedelta(hours=2)},
-        ]).to_parquet(processed / "nba_regular_season_games_2006_26.parquet")
+            {
+                "source_game_id": gid, "season": 2026, "phase": "regular_season",
+                "tipoff_utc": tip, "home_team": "DET", "away_team": "BOS",
+                "source": "test", "first_seen_at_utc": NOW,
+            }
+            for gid, tip in [
+                (1, NOW + timedelta(hours=2)),
+                (2, NOW + timedelta(hours=100)),
+                (3, NOW - timedelta(hours=2)),
+            ]
+        ]).to_parquet(processed / "nba_forward_schedule_2026_27.parquet")
 
         class Paths:
             def __init__(self):
@@ -127,5 +136,5 @@ class TestHorizon:
         class Settings:
             paths = Paths()
 
-        with pytest.raises(ConfigError, match="Missing"):
+        with pytest.raises(ConfigError, match="Missing or empty"):
             mod.upcoming_games(Settings(), now=NOW, horizon_hours=36.0)

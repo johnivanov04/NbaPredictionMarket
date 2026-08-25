@@ -58,6 +58,28 @@ class CollectorState:
     canary_reachable: bool = True
     upcoming_games: int = 0
     games_with_market_identity: int = 0
+
+    #: Of ``upcoming_games``, how many are regular-season games whose data the
+    #: research dataset actually depends on. ``None`` means "same as
+    #: ``upcoming_games``", which is the regular-season case and keeps the
+    #: original behaviour byte for byte.
+    #:
+    #: Preseason exists to shake the collector out operationally and is never
+    #: modelled, so a preseason game with no market loses nothing recoverable.
+    #: Missing a *regular-season* market is unrecoverable, and stays CRITICAL.
+    research_games: int | None = None
+
+    #: Whether the NBA is expected to publish its official Injury Report for
+    #: the current window at all. The report is a regular-season and playoff
+    #: product; the league does not run it for preseason exhibitions.
+    #:
+    #: This gates *alarms only*. The collector still requests every slot and
+    #: still archives anything it finds, so a preseason report that does get
+    #: published is captured exactly as a regular-season one would be. What
+    #: changes is that its absence stops being reported as a fault.
+    report_publication_expected: bool = True
+
+    #: Regular-season games only -- see ``research_games``.
     games_missing_identity_near_anchor: list[Any] = field(default_factory=list)
     failed_fetches: int = 0
     parse_failures: int = 0
@@ -101,15 +123,20 @@ def assess(state: CollectorState) -> list[HealthIssue]:
             "as 'not published' and reports may be silently missed",
         ))
 
+    market_expected = (
+        state.upcoming_games if state.research_games is None
+        else state.research_games
+    )
+
     if state.last_market_observation_utc is None:
-        if state.upcoming_games:
+        if market_expected:
             issues.append(HealthIssue(
                 CRITICAL, "no_market_observations",
                 "games are upcoming but no market has been observed",
             ))
     else:
         age = (state.now_utc - state.last_market_observation_utc).total_seconds()
-        if age > STALE_MARKET_SECONDS and state.upcoming_games:
+        if age > STALE_MARKET_SECONDS and market_expected:
             issues.append(HealthIssue(
                 CRITICAL, "market_feed_stale",
                 f"no market observation for {age:.0f}s",
@@ -152,7 +179,10 @@ def assess(state: CollectorState) -> list[HealthIssue]:
             f"{state.unresolved_players} designated player(s) unresolved",
             {"count": state.unresolved_players},
         ))
-    if state.latest_report_source_timestamp_utc is not None:
+    if (
+        state.latest_report_source_timestamp_utc is not None
+        and state.report_publication_expected
+    ):
         age = (
             state.now_utc - state.latest_report_source_timestamp_utc
         ).total_seconds()
@@ -174,9 +204,18 @@ def assess(state: CollectorState) -> list[HealthIssue]:
             INFO, "no_upcoming_games", "no NBA games scheduled in the window"
         ))
     if state.last_report_observation_utc is None:
-        issues.append(HealthIssue(
-            INFO, "no_report_observed_yet", "no official report observed yet"
-        ))
+        issues.append(
+            HealthIssue(
+                INFO, "no_report_observed_yet", "no official report observed yet"
+            )
+            if state.report_publication_expected
+            else HealthIssue(
+                INFO, "report_publication_not_expected",
+                "no official report observed, and none is expected: the NBA "
+                "does not publish its Injury Report for preseason games. The "
+                "canary still runs, so genuine blocking is still detected.",
+            )
+        )
     if state.upcoming_games and (
         state.games_with_market_identity < state.upcoming_games
     ):

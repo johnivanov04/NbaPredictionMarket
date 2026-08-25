@@ -274,6 +274,19 @@ SEASON_METADATA: Final[dict[int, SeasonInfo]] = {
             "by date -- verified as the only game played league-wide on 2024-12-17."
         ),
     ),
+    2026: _standard(
+        2026, (2026, 10, 20), (2027, 4, 11),
+        play_in=((2027, 4, 13), (2027, 4, 16)), playoffs_start=(2027, 4, 17),
+        nba_cup_final=(2026, 12, 15),
+        notes=(
+            "Forward-looking, declared before the season is played. The published "
+            "schedule assigns only 80 games per team: the last two per team depend "
+            "on Emirates NBA Cup results and are announced later. That makes the "
+            "schedule incomplete *by design*, not corrupt, and a later refresh is "
+            "expected to add the remaining 30 games. Play-in and Cup dates are "
+            "provisional until the league confirms them."
+        ),
+    ),
     2025: _standard(
         2025, (2025, 10, 21), (2026, 4, 12),
         play_in=((2026, 4, 14), (2026, 4, 17)), playoffs_start=(2026, 4, 18),

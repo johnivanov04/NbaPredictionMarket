@@ -2737,6 +2737,217 @@ modelling frame, which makes them the right place to discover an operational
 fault — a stale lock, a rate limit, a mapping gap — at zero research cost. By
 2026-10-20 the collector should already have run unattended for a week.
 
+## Phase 4A3 — 2026-27 schedule ingestion and preseason shakedown
+
+```bash
+python -m nba_prediction_market.pipelines.build_forward_schedule
+python -m nba_prediction_market.pipelines.show_upcoming_games
+python -m nba_prediction_market.pipelines.check_capture_readiness
+```
+
+**Readiness is now PASS**, with no check weakened to get there.
+
+### The schedule, from structured sources
+
+Two sources, because neither covers everything. BALLDONTLIE carries the regular
+season — the same feed every earlier phase used, so team identity stays
+consistent with the frozen historical frame. It carries **no preseason at all**,
+so preseason comes from ESPN's `seasontype=1`.
+
+| | games | ET date range |
+| --- | --- | --- |
+| preseason | 55 | 2026-10-03 … 2026-10-16 |
+| regular season | 1,200 | 2026-10-20 … 2027-04-11 |
+| **total** | **1,255** | |
+
+Both windows match the published league structure exactly, and all 30 teams
+appear with **exactly 80** regular-season games.
+
+Cross-checked against ESPN on six sample dates spanning the season —
+opening night, mid-November, Christmas, January, February and the final day:
+
+**52 of 52 matchups matched, 52 of 52 tipoffs identical, zero games present in
+one source and not the other.**
+
+That check earned its keep. The opener lists BOS@DET at 15:00 ET, which looks
+wrong for an opening night; ESPN independently confirms the same
+`2026-10-20T19:00Z`. An early-afternoon opener is unusual, not an ingestion bug.
+
+### Incomplete by design, not corrupt
+
+1,200 of 1,230 games are assigned. The missing 30 are the last two per team,
+which depend on Emirates NBA Cup results and are published in December.
+
+A schedule 30 games short could equally be a broken ingest, so the difference is
+decided structurally rather than assumed:
+
+```
+status: incomplete_by_design
+  assigned 1200 / 1230, 30 unassigned, per-team [80, 80]
+```
+
+The pattern is recognised only when **every** team sits on the same count and
+the shortfall equals exactly the missing pairings. A season where teams sit on
+different counts reports `unexpectedly_incomplete` and says *investigate* — the
+distinction is tested both ways.
+
+### Refresh is additive and never silently overwrites
+
+| behaviour | guarantee |
+| --- | --- |
+| re-running with unchanged data | no changes, no duplicates |
+| newly assigned Cup games | added; existing games untouched |
+| a tipoff that moved | updated **and recorded**, with both values kept |
+| a game vanishing from a source | reported, not deleted |
+| `first_seen_at_utc` | preserved across refreshes |
+
+A silent overwrite would destroy the only evidence that a game was rescheduled,
+which is precisely what a postponement study needs. Every change is appended to
+`nba_forward_schedule_changes_2026_27.parquet`.
+
+### Preseason is captured and counts toward nothing
+
+Preseason games carry `game_phase = preseason`, are capturable, and have
+`counts_toward_research = False`. They are excluded from model training,
+regular-season evaluation and the discovery/validation protocol, and a test
+confirms they cannot inflate a completeness check into looking full.
+
+They exist to exercise the collector under real conditions — schedule
+discovery, report collection, market matching, polling, event triggers,
+storage, health, restart — at zero research cost. **The same collector command
+runs in preseason and in the regular season**; there is no toy preseason mode.
+
+### The collector
+
+`run_capture_collector` is the long-running process that does the capturing:
+
+```bash
+python -m nba_prediction_market.pipelines.run_capture_collector
+```
+
+An operational verification of Phase 4A3 found that this process **did not
+exist**. Phase 4A2 built and unit-tested every component of it — the observation
+timing model, the orderbook parser, the event trigger, the health assessment —
+but nothing drove them, and the operations doc named
+`build_availability_backfill` as the start command. That command walks *past*
+dates archiving official reports: it never touches Kalshi, holds no lock, writes
+no heartbeat, and exits immediately. Following the documented procedure on
+3 October would have produced no market data at all.
+
+Two further faults fell out of the same check:
+
+* `run_availability_capture` read the frozen historical frame, which ends with
+  2025-26. Every game in it is in the past, so it would have reported an empty
+  slate for ever — quietly, since "no games tonight" is an ordinary answer. It
+  now reads the forward schedule.
+* The lock treated `EPERM` from `os.kill(pid, 0)` as a dead process. That means
+  "the process exists but you may not signal it", so a live collector could have
+  been read as stale and a second one started alongside it.
+
+The collector adds only the process — the loop, the lock, the heartbeat, and the
+wiring. Report fetching still goes through `AvailabilityRunner`, book parsing
+through `parse_book`, transitions through `diff_states`, sampling rate through
+`CaptureScheduler`, health through `health.assess`. No capture logic was
+reimplemented, and there is exactly one collector.
+
+**It cannot place an order.** It uses only public read endpoints, holds no
+credentials, and a test asserts mechanically that no order path exists anywhere
+in `src/` — rather than trusting a sentence like this one.
+
+### Preseason and the official injury report
+
+The NBA's Injury Report is a regular-season and playoff product; the league does
+not run it for preseason exhibitions. So on a preseason night the normal case is
+that **no report is published at all**, and treating that as a fault would have
+produced a CRITICAL alert every day of the shakedown.
+
+Expectation gates the *alarm*, never the capture. The collector still requests
+every slot, so a preseason report that does appear is archived exactly as a
+regular-season one would be. Absence is simply read differently:
+
+| situation | preseason | regular season |
+| --- | --- | --- |
+| no report observed | INFO `report_publication_not_expected` | INFO `no_report_observed_yet` |
+| newest report >6h old | not reported | WARNING |
+| canary URL failing | **CRITICAL** | **CRITICAL** (same) |
+| no market observed | INFO `markets_not_yet_listed` | **CRITICAL** |
+| market feed stale | not reported | **CRITICAL** |
+| storage unwritable | **CRITICAL** | **CRITICAL** (same) |
+
+The two properties that matter are both tested. **Expected absence never masks a
+real outage**: the canary points at a URL known to exist from a past season, so
+it is unaffected by whether tonight's report exists, and a blocked or throttled
+source stays CRITICAL through preseason. **Regular-season expectations are
+untouched**: the market checks key off the count of games that count toward
+research, which in the regular season is the whole slate, and a test asserts
+that the unset default reproduces the old behaviour exactly.
+
+### Kalshi market identity
+
+Against 1,451 currently listed `KXNBAGAME` events:
+
+| status | games |
+| --- | --- |
+| matched | **3** (opening night, 2026-10-20) |
+| not yet listed | 104 |
+| ambiguous | 0 |
+
+Kalshi has listed only opening night so far, which is normal — markets appear
+progressively. Absence is therefore graded by proximity rather than treated as
+an error: months away is **INFO**, inside 12 hours is **WARNING**, inside 6 is
+**CRITICAL**. A game may not reach its anchor unmapped.
+
+Building this surfaced a real bug. The event ticker `KXNBAGAME-26OCT20OKCSAS`
+concatenates both team codes, and a permissive two-to-four-character pattern
+greedily split it as `OKCS` + `AS`, resolving neither — every game silently
+reported as unlisted. Phase 1 had already established that ticker team codes are
+**exactly three characters**; applying that fixed it, and a malformed ticker now
+yields nothing rather than a guess. Two tickers for one game report
+`ambiguous` rather than picking one, because attaching a quote from the wrong
+game is the single error that would corrupt the dataset without trace.
+
+### Readiness
+
+```
+READINESS: PASS
+
+[  ok  ] clock                    skew 0.3s
+[  ok  ] official_report_source   canary 200
+[  ok  ] kalshi_api               6 markets listed; orderbook 200
+[  ok  ] nba_schedule             1255 future game(s) to 2027-04-12; 0 in the
+                                  next 36h (1200 regular, 55 preseason)
+[  ok  ] raw_storage              writable, 113.1 GiB free
+[  ok  ] frozen_model             bundle C C=0.1
+[  ok  ] process_state            no lock held
+```
+
+The schedule check now reads the *forward* schedule rather than the frozen
+historical frame — the earlier WARN was correct, and it is resolved by having
+real future games rather than by relaxing the test. The one remaining known
+limitation is unchanged: no Kalshi credentials, so the collector polls the
+public order book instead of streaming.
+
+Replay stays green after the schedule work: no future observation visible, no
+double-triggering, restart-equivalent.
+
+### Is the system ready for 3 October?
+
+**Yes, with one open item.** Schedule, readiness, replay, mapping and health all
+pass, and the collector has now been run live rather than only described: it
+acquires and releases its lock, refuses to start alongside a live collector,
+takes over a lock left by a crash, polls the three listed opening-night events,
+writes book rows and timed observations, and survives stop and restart. The
+health command reports its state correctly while it runs.
+
+What is still not exercised is a real unattended slate with reports, news and
+status transitions — which is exactly what 3 October is for. The soak-test
+checklist in [`docs/CAPTURE_OPERATIONS.md`](docs/CAPTURE_OPERATIONS.md) lists
+what to verify afterwards, and `summarise_capture_day` produces most of it.
+
+The protocol is unchanged and preseason sits outside it: discovery runs
+2026-10-20 → 2026-12-31, freeze is 2027-01-01, validation runs to the end of the
+regular season.
+
 ## Phase 1 run results (2025-26)
 
 From a live run on 2026-08-19 (`--season 2025`):
@@ -2801,6 +3012,11 @@ Every unmatched record has an identified cause:
   training history for the first development fold, but they are not evidence
   about how good availability features can be, and 2019-20 additionally has 115
   games with no T-30 state at all.
+* **The 2026-27 schedule is 30 games short by design, not by fault.** The
+  league assigns 80 of each team's 82 up front; the rest depend on Emirates NBA
+  Cup results. The completeness check distinguishes that pattern (every team on
+  the same count, shortfall equal to the missing pairings) from a genuinely
+  broken ingest, and reports the latter as `unexpectedly_incomplete`.
 * **Kalshi absorbs official injury news gradually, not instantly — and it does
   not matter.** The immediate reaction is statistically zero; adjustment takes
   5-15 minutes. But the entire 30-minute move for a high-role status change is
@@ -2950,4 +3166,11 @@ src/nba_prediction_market/
   capture/health.py                  collector health and failure severities
   pipelines/check_capture_readiness.py  preseason readiness command
   pipelines/replay_capture.py           deterministic replay validator
+  capture/schedule.py                forward schedule, refresh diff, completeness
+  capture/market_identity.py         game -> Kalshi contract resolution
+  pipelines/build_forward_schedule.py   2026-27 schedule ingest/refresh
+  pipelines/show_upcoming_games.py      upcoming capture slate view
+  pipelines/run_capture_collector.py    THE COLLECTOR: long-running capture loop
+  pipelines/show_capture_health.py      live health of a running collector
+  pipelines/summarise_capture_day.py    post-slate coverage summary
 ```

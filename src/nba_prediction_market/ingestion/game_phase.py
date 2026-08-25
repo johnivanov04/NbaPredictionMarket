@@ -48,6 +48,10 @@ from nba_prediction_market.matching.franchises import is_nba_franchise
 
 logger = logging.getLogger(__name__)
 
+#: Exhibition games before the regular season. Captured for operational
+#: shakedown only -- never modelled, never evaluated, never part of the
+#: discovery/validation protocol.
+PHASE_PRESEASON: Final = "preseason"
 PHASE_REGULAR_SEASON: Final = "regular_season"
 PHASE_PLAY_IN: Final = "play_in"
 PHASE_PLAYOFFS: Final = "playoffs"
@@ -60,6 +64,7 @@ PHASE_OTHER_SPECIAL: Final = "other_special"
 PHASE_UNCLASSIFIED: Final = "unclassified"
 
 GAME_PHASES: Final[tuple[str, ...]] = (
+    PHASE_PRESEASON,
     PHASE_REGULAR_SEASON,
     PHASE_PLAY_IN,
     PHASE_PLAYOFFS,
