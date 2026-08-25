@@ -16,6 +16,7 @@ dependencies = [
     "pydantic>=2.7",
     "tenacity>=8.2",
     "scikit-learn>=1.5",
+    "xgboost>=2.0",
 ]
 
 [project.optional-dependencies]

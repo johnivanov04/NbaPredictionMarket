@@ -1941,6 +1941,224 @@ the top expected-loss quartile — and **disappears where there is nothing to kn
 turning slightly negative in games with no meaningful burden. A uniform gain would
 have suggested the features were proxying for something else.
 
+## Phase 3A4 — nonlinear model class, calibration, ensembles
+
+```bash
+python -m nba_prediction_market.pipelines.build_nonlinear_model
+```
+
+Phase 3A3C closed about a third of the Brier gap to Kalshi by adding genuine
+T-30 availability. The obvious next question is whether the rest is *structure*
+the linear model cannot express — interactions between availability burden and
+team strength, say — or simply information the model does not have.
+
+**It is information.** Nonlinear modelling did not help, and the result is
+unambiguous enough to be worth stating plainly rather than hedged.
+
+### The answer in one table
+
+**Zero of 120 nonlinear candidates beat the frozen Phase 3A3C logistic** on mean
+development Brier. Not the best one, not narrowly — none of them.
+
+| candidate | mean Brier | vs control | mean log loss | mean AUC | mean ECE |
+| --- | --- | --- | --- | --- | --- |
+| **Phase 3A3C logistic (control)** | **0.21297** | — | 0.61393 | 0.7120 | 0.0298 |
+| hgb01 CORE raw | 0.21500 | +0.00203 | 0.61897 | 0.7072 | 0.0324 |
+| xgb04 CORE raw | 0.21515 | +0.00218 | 0.61927 | 0.7068 | 0.0371 |
+| xgb03 CORE raw | 0.21515 | +0.00218 | 0.61934 | 0.7066 | 0.0366 |
+| xgb01 CORE raw | 0.21523 | +0.00226 | 0.61931 | 0.7062 | 0.0366 |
+| hgb03 CORE raw | 0.21537 | +0.00240 | 0.61977 | 0.7062 | 0.0333 |
+| best EXTENDED (hgb03) | 0.21643 | +0.00346 | — | — | — |
+
+And it loses in **every fold**, not on average:
+
+| fold | control Brier | best nonlinear | delta | control AUC | nonlinear AUC |
+| --- | --- | --- | --- | --- | --- |
+| 2021-22 | 0.21828 | 0.22085 | +0.00257 | 0.6981 | 0.6908 |
+| 2022-23 | 0.22216 | 0.22318 | +0.00102 | 0.6751 | 0.6739 |
+| 2023-24 | 0.20743 | 0.21113 | +0.00369 | 0.7320 | 0.7226 |
+| 2024-25 | 0.20400 | 0.20485 | +0.00085 | 0.7427 | 0.7415 |
+
+Four folds, four losses. There is no fold to cherry-pick.
+
+### What was actually searched
+
+The candidate ranges the brief specified cross to **128 configurations**, which
+is a large enough search to find something by luck on ~6,000 training games.
+Instead a **compact hand-picked grid of 16 XGBoost configurations** spans those
+ranges, varying regularisation one axis at a time and moving depth, learning
+rate and tree count together so total capacity stays comparable. Depth is capped
+at 3. Every fit is seeded and deterministic.
+
+Four `HistGradientBoostingClassifier` configurations were included for one
+purpose: to separate "gradient boosting finds no interactions here" from "this
+XGBoost setup was unlucky". The two families land in the same place
+(0.21500 vs 0.21515), so the finding is about gradient boosting, not about
+XGBoost.
+
+20 configurations × 2 feature sets × 3 calibrations × 4 folds = 480 fits.
+
+### Did previously rejected features become useful nonlinearly?
+
+**No — they made things worse.** EXTENDED adds five families that earlier phases
+built, audited, and then dropped under logistic regression: possession-adjusted
+efficiency and Four Factors, roster continuity, generic player quality,
+availability-weighted quality loss, and late-news status transitions. Nothing
+new was engineered for this phase.
+
+| feature set | features | best mean Brier | vs control |
+| --- | --- | --- | --- |
+| CORE (frozen 3A3C allowlist) | 19 | 0.21500 | +0.00203 |
+| EXTENDED (+26 previously rejected) | 45 | 0.21643 | +0.00346 |
+
+CORE beats EXTENDED by a clear margin. Linearity was not what made those
+families look useless; they carry little signal conditional on what the model
+already has, and 26 extra columns on 6,000 rows mostly add variance.
+
+### Calibration made it worse, not better
+
+Boosted trees often rank well and calibrate badly, so this was the most likely
+place for a fix. Calibrators were fitted on **chronological out-of-fold
+predictions generated entirely inside each fold's training history** — walk the
+training seasons forward, predict each with a model fitted only on its
+predecessors, fit the calibrator on those honest out-of-sample probabilities,
+freeze it, then apply it to the outer validation season. The earliest training
+season supplies training rows but is never scored, since nothing precedes it.
+
+| calibration | best mean Brier | best mean ECE |
+| --- | --- | --- |
+| none (raw) | 0.21500 | 0.0324 |
+| sigmoid (Platt) | 0.21579 | 0.0413 |
+| isotonic | 0.21590 | 0.0360 |
+
+Raw wins on both. The models are not badly calibrated in a way a monotone
+transform can fix; they are simply slightly worse at ranking, and a calibrator
+cannot add discrimination it was never given.
+
+### Blending did not help either
+
+| logistic weight | mean Brier | mean log loss | mean AUC |
+| --- | --- | --- | --- |
+| **1.00 (pure logistic)** | **0.21297** | 0.61393 | 0.7120 |
+| 0.75 | 0.21298 | 0.61403 | 0.7122 |
+| 0.50 | 0.21333 | 0.61490 | 0.7115 |
+| 0.25 | 0.21400 | 0.61654 | 0.7098 |
+| 0.00 (pure nonlinear) | 0.21500 | 0.61897 | 0.7072 |
+
+Brier rises monotonically as weight shifts to the nonlinear model. The 0.75
+blend is a hair better on AUC and a hair worse on Brier — well inside noise, and
+not a reason to add a second model to the stack.
+
+### Frozen configuration
+
+The negative-result rule was applied as written: no expanded search, no deeper
+trees, no new features.
+
+| | |
+| --- | --- |
+| model | **`logistic_control`** — the frozen Phase 3A3C logistic, unchanged |
+| reason | no nonlinear candidate beat it by the 5e-4 materiality threshold |
+| feature set | CORE (19 features) |
+| calibration | none |
+| logistic blend weight | 1.00 |
+| C | 0.1 |
+| training history | most recent 5 complete availability-enabled seasons |
+| random seed | 20260824 |
+
+**Control reproduction: max |difference| = 0.0 across all 1,230 holdout games.**
+Phase 3A3C is reproduced exactly, not approximately.
+
+### 2025-26 holdout
+
+| model | Brier | log loss | accuracy | AUC | ECE |
+| --- | --- | --- | --- | --- | --- |
+| Kalshi T-30 normalized | **0.19465** | **0.57013** | 0.6911 | **0.7650** | 0.0335 |
+| **Phase 3A4 (= 3A3C logistic)** | **0.20039** | 0.58539 | **0.6984** | 0.7505 | 0.0275 |
+| Phase 3A4 cadence-harmonized | 0.20054 | 0.58574 | 0.6967 | 0.7500 | 0.0285 |
+| standalone nonlinear (hgb01 CORE) | 0.20129 | 0.58771 | 0.6927 | 0.7499 | 0.0376 |
+| Phase 3A3 | 0.20369 | 0.59366 | 0.6894 | 0.7419 | 0.0269 |
+| MOV Elo | 0.20440 | 0.59564 | 0.6927 | 0.7400 | 0.0395 |
+
+The standalone nonlinear model confirms the development finding out of sample:
+worse Brier, worse log loss, and notably worse calibration (ECE 0.0376 vs
+0.0275) — the miscalibration the out-of-fold calibrators failed to repair.
+
+Paired bootstrap, 10,000 resamples, fixed seed:
+
+| comparison | Brier difference | 95% CI |
+| --- | --- | --- |
+| Phase 3A4 − Phase 3A3C | +0.00000 | [+0.00000, +0.00000] |
+| Phase 3A4 − Kalshi | +0.00574 | [+0.00131, +0.01010] |
+| Phase 3A4 harmonized − Phase 3A3C | +0.00015 | [−0.00036, +0.00063] |
+| Phase 3A4 harmonized − Kalshi | +0.00589 | [+0.00145, +0.01026] |
+
+The first row is identically zero because the frozen model *is* Phase 3A3C.
+Cadence harmonization again moves nothing (CI spans zero), reproducing the
+3A3C sensitivity result without retuning.
+
+**0% of the remaining gap was closed.** The Phase 3A3 → Kalshi gap was 0.00904;
+Phase 3A3C closed 0.00330 (36.5%) and Phase 3A4 closed none of the remaining
+0.00574.
+
+### Where the nonlinear model differed
+
+Diagnostics only — the configuration was frozen before the holdout was scored,
+so nothing here could have altered it. Because the frozen model is the control,
+the informative comparison is the standalone nonlinear model against it:
+
+| segment | games | 3A3C Brier | nonlinear Brier | delta |
+| --- | --- | --- | --- | --- |
+| both sides heavily designated | 473 | 0.19711 | 0.19918 | +0.00208 |
+| low availability burden | 308 | 0.20700 | 0.20896 | +0.00196 |
+| underdogs | 307 | 0.18364 | 0.18520 | +0.00156 |
+| late season | 615 | 0.17978 | 0.18136 | +0.00158 |
+| high availability burden | 308 | 0.18321 | 0.18439 | +0.00117 |
+| high-minute OUT present | 769 | 0.19849 | 0.19934 | +0.00085 |
+| close games | 390 | 0.24189 | 0.24180 | −0.00009 |
+
+This is the part that makes the negative result convincing. The **both sides
+heavily designated** segment is precisely where the brief expected interactions
+to live — several important players carrying simultaneous statuses — and it is
+the segment where boosting does *worst*. Only close games are a tie, and that is
+where every model is near 0.24 anyway.
+
+### Feature importance
+
+Permutation importance on development data (fold 2024-25, negative-Brier
+scoring), reported descriptively:
+
+| feature | permutation importance |
+| --- | --- |
+| `mov_elo_diff` | +0.03831 |
+| `avail_out_expected_minutes_diff` | +0.00732 |
+| `elo_diff` | +0.00181 |
+| `last5_point_diff_difference` | +0.00145 |
+| `last10_point_diff_difference` | +0.00115 |
+
+Margin-of-victory Elo dominates by an order of magnitude, and **role-weighted
+OUT burden is the second most important feature in the model** — ahead of every
+other strength measure. That is consistent with Phase 3A3C: availability
+carries real signal, and it is concentrated almost entirely in who is OUT.
+`avail_doubtful_expected_minutes_diff` contributes nothing measurable, which
+matches its calibration (doubtful players play 1.1% of the time, so the feature
+is nearly collinear with OUT).
+
+Importance is not causal here: these features correlate with each other, and a
+family absorbing another's credit is expected.
+
+### What this means
+
+The gap to Kalshi is **information-limited, not model-limited**. Two independent
+gradient-boosting families, twenty configurations, two feature sets, three
+calibrations and five blend weights all failed to find structure that logistic
+regression on the same information was missing. The remaining 0.00574 Brier is
+unlikely to be recovered by a better fit to what we already know.
+
+Kalshi still wins on Brier, log loss and AUC — but Phase 3A4 is **ahead on
+accuracy** (0.6984 vs 0.6911) and **better calibrated** (ECE 0.0275 vs 0.0335).
+The market's edge is in discrimination, which is what a market with access to
+information we do not have should look like.
+
 ## Phase 1 run results (2025-26)
 
 From a live run on 2026-08-19 (`--season 2025`):
@@ -2005,6 +2223,12 @@ Every unmatched record has an identified cause:
   training history for the first development fold, but they are not evidence
   about how good availability features can be, and 2019-20 additionally has 115
   games with no T-30 state at all.
+* **Nonlinear modelling was tested and rejected, and the search was
+  deliberately not widened.** Zero of 120 gradient-boosted candidates beat the
+  frozen logistic on development folds, so the negative-result rule applied: no
+  deeper trees, no expanded grid, no new features. A later phase that revisits
+  model class should bring *new information*, not a bigger search over the same
+  information.
 * **Late-news features are built and tested but not used.** Movement between
   T-3h and T-30 is real, yet adding it made development performance worse: by
   T-30 the level already encodes the movement. The machinery stays because
@@ -2100,6 +2324,9 @@ src/nba_prediction_market/
   features/availability_features.py  role-weighted T-30 availability aggregates
   models/status_calibration.py       what each designation predicts, per fold
   models/availability_bundles.py     Phase 3A3C ablation bundles
+  models/nonlinear.py                gradient-boosted configs, compact fixed grid
+  models/nonlinear_bundles.py        Phase 3A4 CORE and EXTENDED allowlists
+  models/probability_calibration.py  leakage-safe chronological calibration
   pipelines/build_dataset.py         Phase 1 CLI entry point
   pipelines/build_pregame_quotes.py  Phase 2 CLI entry point
   pipelines/build_availability_audit.py     Phase 3A3B0 CLI entry point
@@ -2109,4 +2336,5 @@ src/nba_prediction_market/
   pipelines/build_availability_coverage.py  season/source coverage matrix
   pipelines/build_availability_features.py  T-30 availability feature builder
   pipelines/build_availability_model.py     Phase 3A3C CLI entry point
+  pipelines/build_nonlinear_model.py        Phase 3A4 CLI entry point
 ```
