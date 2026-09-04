@@ -37,6 +37,16 @@ RANDOM_STATE: Final = 20260820
 class LogisticConfig:
     """A complete logistic specification."""
 
+    #: How many prior seasons the model is *specified* to train on -- a count,
+    #: ``HISTORY_ALL``, or ``HISTORY_WEIGHTED``.
+    #:
+    #: This is a description of the intended window, not an instruction that
+    #: anything acts on by itself. :func:`fit_logistic` fits exactly the rows it
+    #: is given and uses this field only to decide recency weighting; applying
+    #: the window is the caller's job, via :func:`training_seasons`. The name
+    #: reads like a filter, which is precisely how Phase 4A4 came to train a
+    #: six-season control against a frozen five-season one, so ``fit_logistic``
+    #: now raises rather than quietly obliging a caller who assumed otherwise.
     training_history: int | str
     c_value: float
     half_life: float | None = None
@@ -148,14 +158,57 @@ class FittedLogistic:
         return self.pipeline.predict_proba(feature_matrix(frame, self.features))[:, 1]
 
 
+def _assert_window_respected(
+    training: pd.DataFrame, config: LogisticConfig
+) -> None:
+    """Verify the caller already applied a finite training window.
+
+    Only a finite ``training_history`` constrains anything: the all-available
+    and weighted strategies deliberately keep every prior season, so there is
+    nothing to check for them.
+    """
+    if not isinstance(config.training_history, int):
+        return
+    if "season" not in training.columns:
+        return
+    seasons = sorted(training["season"].unique().tolist())
+    if len(seasons) > config.training_history:
+        raise TrainingWindowError(
+            f"training_history={config.training_history} but {len(seasons)} "
+            f"seasons were supplied ({seasons}). fit_logistic does not filter "
+            f"rows; apply training_seasons(config, validation_season, "
+            f"available) and select those seasons before calling."
+        )
+
+
+class TrainingWindowError(ValueError):
+    """The supplied rows span more seasons than the configuration allows."""
+
+
 def fit_logistic(
     training: pd.DataFrame,
     config: LogisticConfig,
     features: Sequence[str] | None = None,
 ) -> FittedLogistic:
-    """Fit the pipeline on ``training`` only, applying recency weights if configured."""
+    """Fit the pipeline on exactly the rows supplied.
+
+    **This function does not select training rows.** ``config.training_history``
+    describes the window the caller is expected to have already applied -- via
+    :func:`training_seasons` -- and here it only decides whether recency
+    weighting is used. Passing an unfiltered frame therefore trains on
+    everything in it, which is how Phase 4A4 briefly trained a six-season
+    control against a frozen five-season one.
+
+    Because that failure is silent and its symptom (slightly different
+    probabilities) is easy to rationalise, a finite window is now *checked*
+    rather than assumed: supplying more seasons than ``training_history``
+    permits raises :class:`TrainingWindowError`. The rows are still never
+    filtered here -- silently discarding a caller's data would trade one quiet
+    wrong answer for another.
+    """
     if training.empty:
         raise ValueError("no training rows supplied")
+    _assert_window_respected(training, config)
     x = feature_matrix(training, features)
     y = training[TARGET].astype(int).to_numpy()
 

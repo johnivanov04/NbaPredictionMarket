@@ -98,6 +98,12 @@ HEARTBEAT_SECONDS: float = 30.0
 #: so a game with no ticker at start of shift can acquire one mid-shift.
 IDENTITY_REFRESH_SECONDS: float = 600.0
 
+#: How often the referee-assignment page is re-read. The league posts around
+#: 09:00 ET and occasionally reassigns during the day, so a half-hourly read
+#: catches changes at a cost of ~48 requests a day. Strictly additive: a
+#: failure here never touches report or market capture.
+REFEREE_REFRESH_SECONDS: float = 1800.0
+
 REQUEST_TIMEOUT_SECONDS: float = 30.0
 
 
@@ -319,6 +325,10 @@ class Collector:
     previous_states: dict[tuple[Any, str, Any], str] | None = None
     last_polled: dict[Any, datetime] = field(default_factory=dict)
     last_identity_refresh: datetime | None = None
+    last_referee_refresh: datetime | None = None
+    capture_referees: bool = True
+    referee_assignments: int = 0
+    referee_failures: int = 0
     mappings: list[Any] = field(default_factory=list)
     last_market_observation: datetime | None = None
     last_report_observation: datetime | None = None
@@ -344,7 +354,41 @@ class Collector:
         self._refresh_identity(games, now)
         self._capture_reports(client, games, now)
         self._poll_markets(client, games, now)
+        self._capture_referees(now)
         self.scheduler.prune(now)
+
+    def _capture_referees(self, now: datetime) -> None:
+        """Optional, additive, and never load-bearing.
+
+        Wrapped whole: a missing crew costs one experimental feature, while an
+        exception escaping here would cost the slate's report and market
+        coverage, which is unrecoverable. That asymmetry is why this swallows
+        everything and only counts the failure.
+        """
+        if not self.capture_referees:
+            return
+        due = (
+            self.last_referee_refresh is None
+            or (now - self.last_referee_refresh).total_seconds()
+            >= REFEREE_REFRESH_SECONDS
+        )
+        if not due:
+            return
+        self.last_referee_refresh = now
+        try:
+            from nba_prediction_market.pipelines.capture_referee_assignments import (
+                capture_once,
+            )
+
+            result = capture_once(self.settings, now=now)
+            if result.get("captured"):
+                self.referee_assignments = result.get("assignments", 0)
+            else:
+                self.referee_failures += 1
+                logger.warning("referee capture failed: %s", result.get("error"))
+        except Exception as exc:
+            self.referee_failures += 1
+            logger.warning("referee capture raised %s", type(exc).__name__)
 
     def _refresh_identity(self, games: list[Any], now: datetime) -> None:
         due = (
@@ -502,6 +546,8 @@ class Collector:
             "status_changes_detected": self.changes_detected,
             "sampling_triggers_fired": self.triggers_fired,
             "games_at_event_rate": len(self.scheduler.elevated_games(now)),
+            "referee_assignments": self.referee_assignments,
+            "referee_capture_failures": self.referee_failures,
         }
         path = self.settings.paths.reports / "capture_health.json"
         path.write_text(json.dumps(payload, indent=2, default=str), encoding="utf-8")
@@ -515,6 +561,7 @@ def run_pipeline(
     duration_seconds: float | None = None,
     once: bool = False,
     tick_seconds: float = TICK_SECONDS,
+    capture_referees: bool = True,
 ) -> dict[str, Any]:
     settings = settings or load_settings()
     settings.paths.ensure()
@@ -524,7 +571,9 @@ def run_pipeline(
         )
 
     lock = CollectorLock(settings.paths.root / "raw" / "capture" / "collector.lock")
-    collector = Collector(settings, horizon_hours=horizon_hours)
+    collector = Collector(
+        settings, horizon_hours=horizon_hours, capture_referees=capture_referees
+    )
     stopping = {"now": False}
 
     def _stop(signum: int, _frame: FrameType | None) -> None:
@@ -577,6 +626,8 @@ def run_pipeline(
         "status_changes_detected": collector.changes_detected,
         "sampling_triggers_fired": collector.triggers_fired,
         "failed_fetches": collector.failed_fetches,
+        "referee_assignments": collector.referee_assignments,
+        "referee_capture_failures": collector.referee_failures,
         "health": health,
     }
     path = settings.paths.reports / "capture_collector_run.json"
@@ -601,6 +652,10 @@ def build_arg_parser() -> argparse.ArgumentParser:
         "--once", action="store_true",
         help="Run a single tick and exit. For smoke tests.",
     )
+    parser.add_argument(
+        "--no-referees", action="store_true",
+        help="Skip referee-assignment capture. It is optional either way.",
+    )
     return parser
 
 
@@ -614,6 +669,7 @@ def main(argv: list[str] | None = None) -> int:
             horizon_hours=args.horizon_hours,
             duration_seconds=args.duration_seconds,
             once=args.once,
+            capture_referees=not args.no_referees,
         )
     except LockHeld as exc:
         print(f"error: {exc}", file=sys.stderr)

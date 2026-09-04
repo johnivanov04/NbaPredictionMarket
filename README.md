@@ -2948,6 +2948,214 @@ The protocol is unchanged and preseason sits outside it: discovery runs
 2026-10-20 → 2026-12-31, freeze is 2027-01-01, validation runs to the end of the
 regular season.
 
+## Phase 4A4 — referee assignments as a pregame information family
+
+The NBA publishes each day's officiating crews around 09:00 ET, hours before
+the earliest T-6h anchor. Unlike another rearrangement of past scores, the
+identity of tonight's crew is genuinely new pregame information, which is the
+only reason it is worth testing at all.
+
+Full source audit: [`docs/REFEREE_DATA.md`](docs/REFEREE_DATA.md).
+
+### The source audit decided the shape of the phase
+
+| source | officials | stable ids | positions | usable |
+| --- | --- | --- | --- | --- |
+| stats.nba.com `boxscoresummaryv2` | yes | yes (`OFFICIAL_ID`) | order appears positional | **no — blocked** |
+| Basketball-Reference box scores | yes | yes (slug) | **no — alphabetical** | **yes** |
+| Basketball-Reference referee pages | aggregates only | yes | no | no — retrospective |
+| official.nba.com assignments | yes | no | **yes** | prospective only |
+
+**stats.nba.com is the better source and is unavailable from here.** It served
+exactly one request and then blocked the address: five retries timed out after
+a cooldown and it had not recovered minutes later.
+
+**Basketball-Reference lists a game's officials alphabetically.** Verified on
+the 2023-10-24 Denver box score (Cutler, Twardoski, Williams), against an NBA
+ordering for another game that is not alphabetical (Forte, Barnaky, Mehta).
+Name order is therefore not position order, and crew chief / referee / umpire
+**cannot be recovered historically**.
+
+That makes bundle D unbuildable. It is declared in
+`referees/bundles.py:UNBUILDABLE_BUNDLES` with its reason rather than quietly
+dropped, and no feature anywhere claims a position it does not have. The NBA's
+own page *does* publish all four positions, so prospective capture records them
+from now on and a later phase can test the family once seasons accumulate.
+
+### Retrieval cost is the binding constraint
+
+Basketball-Reference publishes `Crawl-delay: 3`. Honouring it puts a
+seven-season backfill of 8,289 joinable games at about **7.1 hours**, and that
+is not negotiable downward. Pages are cached before parsing, so a parser change
+never refetches and an interrupted run resumes where it stopped. Fetch order is
+development seasons first, then the 2025-26 benchmark, then the two warm-up
+seasons, so an interrupted backfill still leaves a usable dataset rather than a
+warm-up period and nothing to test on.
+
+One bug found here: the delay was being timed from the *response*, making every
+cycle delay-plus-download — roughly six seconds a page, slower than asked for
+without being any kinder. Crawl-delay is the interval between request *starts*.
+
+### Joining is deterministic
+
+Monthly schedule pages give each game's box score address plus its date and both
+team codes; the key is the Eastern date plus both canonical team codes.
+Basketball-Reference codes that differ (`PHO`, `BRK`, `CHO`, and historical
+`NJN`, `NOH`, `SEA`, `VAN`, `CHH`) are mapped explicitly, an unrecognised code
+is reported rather than guessed, and a key matching more than one source row is
+recorded ambiguous rather than resolved arbitrarily. Officials are keyed by
+Basketball-Reference slug, never by name: names are not unique and they change,
+so keying on one would silently merge two officials or split one.
+
+### Leakage safety is enforced by the API, not by convention
+
+`features_for` reads state and `update` writes it; nothing does both. Tests
+mutate a game's own result and assert its own features do not move, and mutate a
+future game and assert earlier features do not move.
+
+Sorting by tip-off is not sufficient on its own. A game tipping at 19:00 is
+still being played when the 19:30 game starts, so its result cannot inform the
+later game even though it started earlier. State updates are therefore deferred
+until a game has plausibly finished (3 hours, deliberately generous — erring
+long withholds information rather than leaking it).
+
+League baselines are sequential for the same reason: a tendency measured against
+a final-season league average would be scored against a number that did not
+exist yet.
+
+### Tendencies, not win records
+
+Raw "team X is 12-3 under referee Y" records are sparse, confounded by which
+fixtures an official is assigned, and numerous enough that something always
+looks remarkable. Nothing like that reaches the model. Instead:
+
+* every tendency is **league-relative** and **shrunk**,
+  `(n / (n + k)) * observed + (k / (n + k)) * baseline`, so an official with
+  five games and one with five hundred are not treated alike. An official with
+  no history scores exactly zero — no signal, rather than an arbitrary constant;
+* the home-effect tendency is **expectation-adjusted**: the residual of the
+  observed home result against the frozen MOV-Elo pregame probability from
+  Phase 2, so it measures home advantage beyond what a basketball-strength model
+  already expected rather than raw home winning percentage;
+* **team x referee interactions stay diagnostic**. The audit reports cell-size
+  support and stops. It deliberately does not report win rates or extremes,
+  because producing that table is how a spurious finding gets manufactured.
+
+Nine features total across three buildable families — whistle/environment,
+expectation-adjusted home/visitor, and experience — under an explicit
+allowlist that the feature builder asserts against.
+
+### Call-level play-by-play: audited, not feasible
+
+Basketball-Reference play-by-play carries 34 typed foul rows for a sampled game
+(`Shooting foul by A. Davis (drawn by N. Jokić)`) and **zero** referee links
+inside them. Foul type is available; attribution to an individual official is
+not. The NBA's own play-by-play does carry it, on the host that blocked us. The
+richer layer stays out of scope — blocked by access rather than by data.
+
+### Result: no buildable referee family adds anything
+
+Coverage is complete. Basketball-Reference lists an entry for every one of the
+**8,289** regular-season games across seven seasons, and all 8,289 were
+retrieved and mapped: **0 absent from source, 0 ambiguous, 0 fetch failures**.
+98 distinct officials, no renames, no two officials sharing a normalised name.
+Crew sizes are 3 in 8,282 games, 4 in five, and 2 in two -- the 2-official
+games fall in the COVID-affected seasons, and none of these are padded or
+truncated.
+
+Development ablation, 2021-22 through 2024-25, C=0.1, k=25:
+
+| season | control | B whistle | C home-adjusted | E experience |
+| --- | --- | --- | --- | --- |
+| 2021-22 | 0.21828 | 0.21857 | 0.21867 | 0.22339 |
+| 2022-23 | 0.22216 | 0.22171 | 0.22270 | 0.22320 |
+| 2023-24 | 0.20743 | 0.20756 | 0.20776 | 0.20815 |
+| 2024-25 | 0.20400 | 0.20417 | 0.20406 | 0.20401 |
+| **mean** | **0.21297** | 0.21300 | 0.21330 | 0.21469 |
+| **delta** | — | **+0.000034** | **+0.000329** | **+0.001717** |
+| seasons improved | — | 1/4 | 0/4 | 0/4 |
+
+Every family is worse than the control, at every shrinkage constant tried:
+
+| k | control | best family |
+| --- | --- | --- |
+| 25 | 0.212969 | 0.213002 |
+| 50 | 0.212969 | 0.213040 |
+| 100 | 0.212969 | 0.213122 |
+
+So no family earned inclusion, bundle F was never assembled, and there is no
+enhanced model to benchmark or bootstrap. Reporting a paired interval here
+would mean inventing a second model to compare against.
+
+The 2025-26 control is the canonical frozen Phase 3A3C model, reproduced
+exactly: its predictions match the stored artefact with **max absolute
+difference 0.0** across all 1,230 games, scoring Brier 0.20039, log loss
+0.58539, AUC 0.75051, ECE 0.02754. Kalshi's own T-30 prices score **0.19465**
+on the same games, so the gap this project is trying to close is untouched by
+referee information.
+
+Reproducing it took a correction. ``fit_logistic`` fits whatever rows it is
+handed -- ``training_history`` only selects recency weighting, it does not
+filter -- so handing it every prior season trained the control on six seasons
+where the frozen model uses five. Development folds were unaffected, because
+none of them ever has more than five prior seasons; only the holdout was wrong.
+``evaluate`` now applies the rolling window itself rather than trusting either
+the caller or ``fit_logistic``, and a dataset test pins the reproduction at
+exactly zero difference.
+
+### The result that looked interesting, and why it is not
+
+Crews in the top quintile of expectation-adjusted home tendency saw a 61.4%
+home-win rate in 2025-26 against 55.7% for the bottom quintile. That is the
+shape of a finding, and it is not one.
+
+Crews are not assigned at random, so a high-tendency group can simply contain
+stronger home teams. The question is whether the control *already* predicts the
+difference. It does: the residual gap between observed and predicted home rate
+is positive in **both** tails (+0.038 at 1.2 SE, +0.019 at 0.6 SE) and negative
+in the middle. A genuine referee home effect would push the low tail negative.
+This is a calibration artefact.
+
+Every post-freeze segment tells the same story -- high and low whistle crews,
+veteran and inexperienced crews, close games, favourites, underdogs, high
+availability-burden games -- with every gap inside 1.2 standard errors of zero.
+The diagnostics now carry that standard error alongside each gap, so a
+246-game tail bin cannot be read as confidently as a full season.
+
+Team x referee support, over all seven seasons: 2,697 cells, median 20 games
+each, only 9.5% reaching 30 games. Insufficient, as predicted, and the audit
+reports support only -- never win rates.
+
+### Recommendation: CAPTURE ONLY
+
+Do not add referees to the model. Keep capturing, for two reasons: it costs
+about 48 requests a day and is already wired in, and it records the officiating
+positions that **no historical source provides**, which is the only way the
+crew-chief family this phase could not build ever becomes testable.
+
+Not DROP, because the hypothesis is only half tested. Not INCLUDE, because the
+half that was tested produced nothing.
+
+### Prospective capture
+
+```bash
+python -m nba_prediction_market.pipelines.capture_referee_assignments
+```
+
+Runs inside the collector every 30 minutes and is **strictly additive**: the
+call is wrapped whole, failures are counted, and nothing it does can interrupt
+report or market capture. A missing crew costs one experimental feature; an
+exception escaping would cost coverage that cannot be recovered. `--no-referees`
+disables it entirely.
+
+Assignments change during the day, so both states are kept with their own
+first-observed times, and `known_at(matchup, cutoff)` returns only what was
+observed by that cutoff — a crew discovered at 14:00 can never be backfilled
+into a T-6h prediction. Re-observing an unchanged crew records nothing and
+preserves the original first-observed time, which is what makes restarts
+harmless. An empty table is a normal result: the offseason, and every morning
+before the league posts.
+
 ## Phase 1 run results (2025-26)
 
 From a live run on 2026-08-19 (`--season 2025`):
@@ -3173,4 +3381,15 @@ src/nba_prediction_market/
   pipelines/run_capture_collector.py    THE COLLECTOR: long-running capture loop
   pipelines/show_capture_health.py      live health of a running collector
   pipelines/summarise_capture_day.py    post-slate coverage summary
+  referees/bbref_source.py           historical officials source + parsing
+  referees/fetch.py                  paced, cached, resumable retrieval
+  referees/identity.py               officials keyed by slug, never by name
+  referees/state.py                  sequential tendency state + shrinkage
+  referees/bundles.py                predetermined referee ablations
+  referees/assignments.py            published crews, as-of semantics
+  referees/diagnostics.py            post-freeze segments, team x ref support
+  pipelines/build_referee_assignments.py  historical assignment dataset
+  pipelines/build_referee_features.py     leakage-safe referee features
+  pipelines/build_referee_model.py        Phase 4A4 incremental signal test
+  pipelines/capture_referee_assignments.py  prospective assignment capture
 ```

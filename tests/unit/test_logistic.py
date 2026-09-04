@@ -15,6 +15,7 @@ from nba_prediction_market.models.logistic import (
     HISTORY_ALL,
     HISTORY_WEIGHTED,
     LogisticConfig,
+    TrainingWindowError,
     build_pipeline,
     feature_matrix,
     fit_logistic,
@@ -225,3 +226,84 @@ def test_weighted_history_requires_a_half_life() -> None:
 def test_empty_training_data_is_rejected() -> None:
     with pytest.raises(ValueError, match="no training rows"):
         fit_logistic(frame(n=0), LogisticConfig(training_history=3, c_value=1.0))
+
+
+# --- training window semantics ---------------------------------------------
+
+
+class TestTrainingHistoryDoesNotFilter:
+    """``training_history`` describes a window; it never selects rows.
+
+    Phase 4A4 read the name as an instruction and handed ``fit_logistic`` six
+    seasons against a frozen five-season control. The rows are still not
+    filtered here -- silently discarding a caller's data would swap one quiet
+    wrong answer for another -- but the mistake is now loud.
+    """
+
+    def _multi(self, seasons):
+        return pd.concat([frame(n=120, season=s) for s in seasons],
+                         ignore_index=True)
+
+    def test_supplying_more_seasons_than_the_window_raises(self):
+        training = self._multi([2019, 2020, 2021, 2022, 2023, 2024])
+        with pytest.raises(TrainingWindowError, match="does not filter rows"):
+            fit_logistic(training, LogisticConfig(training_history=5, c_value=0.1))
+
+    def test_the_error_names_the_window_and_what_was_supplied(self):
+        training = self._multi([2019, 2020, 2021])
+        with pytest.raises(TrainingWindowError) as exc:
+            fit_logistic(training, LogisticConfig(training_history=2, c_value=1.0))
+        message = str(exc.value)
+        assert "training_history=2" in message
+        assert "3 seasons" in message
+        assert "training_seasons(" in message, "must say how to fix it"
+
+    def test_exactly_the_window_is_accepted(self):
+        training = self._multi([2020, 2021, 2022, 2023, 2024])
+        fitted = fit_logistic(training, LogisticConfig(training_history=5, c_value=0.1))
+        assert fitted.n_training_rows == len(training)
+
+    def test_fewer_seasons_than_the_window_are_accepted(self):
+        """Early folds legitimately have less history than the window allows."""
+        training = self._multi([2019, 2020])
+        fitted = fit_logistic(training, LogisticConfig(training_history=5, c_value=0.1))
+        assert fitted.training_seasons == [2019, 2020]
+
+    def test_rows_are_never_silently_dropped(self):
+        """The guard checks; it must not quietly reshape the caller's data."""
+        training = self._multi([2020, 2021, 2022])
+        fitted = fit_logistic(training, LogisticConfig(training_history=3, c_value=1.0))
+        assert fitted.n_training_rows == 360
+        assert fitted.training_seasons == [2020, 2021, 2022]
+
+    def test_all_available_history_is_unconstrained(self):
+        training = self._multi([2015, 2016, 2017, 2018, 2019, 2020, 2021])
+        fitted = fit_logistic(
+            training, LogisticConfig(training_history=HISTORY_ALL, c_value=1.0)
+        )
+        assert len(fitted.training_seasons) == 7
+
+    def test_weighted_history_is_unconstrained(self):
+        training = self._multi([2015, 2016, 2017, 2018, 2019, 2020])
+        fitted = fit_logistic(
+            training,
+            LogisticConfig(training_history=HISTORY_WEIGHTED, c_value=1.0,
+                           half_life=2.0),
+        )
+        assert len(fitted.training_seasons) == 6
+
+    def test_training_seasons_is_the_helper_that_applies_the_window(self):
+        config = LogisticConfig(training_history=5, c_value=0.1)
+        available = [2019, 2020, 2021, 2022, 2023, 2024]
+        assert training_seasons(config, 2025, available) == [
+            2020, 2021, 2022, 2023, 2024
+        ]
+
+    def test_the_helper_output_always_satisfies_the_guard(self):
+        """Using the documented helper can never trip the check."""
+        config = LogisticConfig(training_history=5, c_value=0.1)
+        available = [2019, 2020, 2021, 2022, 2023, 2024]
+        for season in (2021, 2022, 2023, 2024, 2025):
+            seasons = training_seasons(config, season, available)
+            training = self._multi(seasons)
+            fit_logistic(training, config)  # must not raise

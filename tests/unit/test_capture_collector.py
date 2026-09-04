@@ -229,3 +229,89 @@ class TestPreseasonMarketExpectations:
         assert any(
             i.code == "low_disk_space" and i.severity == WARNING for i in issues
         )
+
+
+class TestRefereeCaptureIsOptional:
+    """Referee capture is additive: it must never cost report or market coverage."""
+
+    def _collector(self, tmp_path):
+        from nba_prediction_market.pipelines.run_capture_collector import Collector
+
+        class Paths:
+            root = tmp_path
+
+            @property
+            def processed(self):
+                return tmp_path / "processed"
+
+            @property
+            def reports(self):
+                return tmp_path / "reports"
+
+            def ensure(self):
+                for p in (self.processed, self.reports):
+                    p.mkdir(parents=True, exist_ok=True)
+
+        class Settings:
+            paths = Paths()
+
+        Settings.paths.ensure()
+        return Collector(Settings())
+
+    def test_a_raising_capture_does_not_propagate(self, tmp_path, monkeypatch):
+        collector = self._collector(tmp_path)
+        import nba_prediction_market.pipelines.capture_referee_assignments as mod
+
+        def boom(*args, **kwargs):
+            raise RuntimeError("the page changed shape")
+
+        monkeypatch.setattr(mod, "capture_once", boom)
+        collector._capture_referees(NOW)          # must not raise
+        assert collector.referee_failures == 1
+
+    def test_a_failed_capture_is_counted_not_raised(self, tmp_path, monkeypatch):
+        collector = self._collector(tmp_path)
+        import nba_prediction_market.pipelines.capture_referee_assignments as mod
+
+        monkeypatch.setattr(
+            mod, "capture_once", lambda *a, **k: {"captured": False, "error": "403"}
+        )
+        collector._capture_referees(NOW)
+        assert collector.referee_failures == 1
+        assert collector.referee_assignments == 0
+
+    def test_capture_can_be_switched_off_entirely(self, tmp_path, monkeypatch):
+        collector = self._collector(tmp_path)
+        collector.capture_referees = False
+        import nba_prediction_market.pipelines.capture_referee_assignments as mod
+
+        def boom(*args, **kwargs):
+            raise AssertionError("must not be called when disabled")
+
+        monkeypatch.setattr(mod, "capture_once", boom)
+        collector._capture_referees(NOW)
+        assert collector.referee_failures == 0
+
+    def test_capture_is_rate_limited_not_run_every_tick(self, tmp_path, monkeypatch):
+        collector = self._collector(tmp_path)
+        import nba_prediction_market.pipelines.capture_referee_assignments as mod
+
+        calls = []
+        monkeypatch.setattr(
+            mod, "capture_once",
+            lambda *a, **k: calls.append(1) or {"captured": True, "assignments": 2},
+        )
+        collector._capture_referees(NOW)
+        collector._capture_referees(NOW + timedelta(seconds=60))
+        assert len(calls) == 1, "a half-hourly page must not be read every second"
+
+    def test_a_successful_capture_records_the_count(self, tmp_path, monkeypatch):
+        collector = self._collector(tmp_path)
+        import nba_prediction_market.pipelines.capture_referee_assignments as mod
+
+        monkeypatch.setattr(
+            mod, "capture_once", lambda *a, **k: {"captured": True, "assignments": 7}
+        )
+        collector._capture_referees(NOW)
+        assert collector.referee_assignments == 7
+        assert collector.referee_failures == 0
