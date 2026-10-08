@@ -46,6 +46,8 @@ class RunnerStats:
     already_present: int = 0
     unavailable: int = 0
     failed: int = 0
+    #: Attempts served from this run's per-slot memo instead of the network.
+    deduplicated: int = 0
 
     def to_dict(self) -> dict[str, int]:
         return {
@@ -54,6 +56,7 @@ class RunnerStats:
             "already_present": self.already_present,
             "source_unavailable": self.unavailable,
             "failed": self.failed,
+            "deduplicated": self.deduplicated,
         }
 
 
@@ -103,6 +106,24 @@ class AvailabilityRunner:
         self.retry_backoff_seconds = retry_backoff_seconds
         self._sleep = sleep
         self.stats = RunnerStats()
+        # Outcome of every slot this runner has already requested, so a slot is
+        # fetched at most once per run. ``archive.has`` already skips an
+        # archived slot, but a slot that answered 403 archives nothing, so
+        # without this every remaining task for it refetches the same URL.
+        # A runner is constructed per run, so this is per-run state.
+        self._attempted: dict[str, tuple[str, datetime | None, str | None]] = {}
+
+    def _count(self, outcome: str) -> None:
+        """Count a memo hit as the outcome it reproduces.
+
+        Keeps ``stats`` consistent with ``results``: nine tasks sharing an
+        unavailable slot still report nine unavailable attempts, exactly as
+        before, while making only one request.
+        """
+        if outcome == "source_unavailable":
+            self.stats.unavailable += 1
+        elif outcome == "failed":
+            self.stats.failed += 1
 
     def _fetch_with_retry(self, url: str) -> tuple[int, bytes, dict[str, str]]:
         last: Exception | None = None
@@ -127,22 +148,42 @@ class AvailabilityRunner:
                 task, "already_present", slot, slot.report_timestamp_utc
             )
 
+        memo = self._attempted.get(slot.filename)
+        if memo is not None:
+            # One report covers every game in its window, and a game's nine
+            # capture offsets all resolve to the same slot because the anchor is
+            # a single instant per game. Refetching it once per task is the
+            # repeat-request pattern this module's docstring warns about: it
+            # spends the rate-limit budget and can push the canary into
+            # reporting a block that never happened.
+            outcome, retrieved, error = memo
+            self.stats.deduplicated += 1
+            self._count(outcome)
+            return CaptureResult(
+                task, outcome, slot, retrieved_at_utc=retrieved, error=error
+            )
+
         try:
             status, content, headers = self._fetch_with_retry(slot.url)
         except RuntimeError as exc:
             self.stats.failed += 1
             logger.warning("capture failed for %s: %s", slot.filename, exc)
+            self._attempted[slot.filename] = ("failed", None, str(exc))
             return CaptureResult(task, "failed", slot, error=str(exc))
 
         retrieved = (now or datetime.now(UTC)).astimezone(UTC)
         if status == NOT_AVAILABLE_STATUS:
             self.stats.unavailable += 1
+            self._attempted[slot.filename] = (
+                "source_unavailable", retrieved, None
+            )
             return CaptureResult(task, "source_unavailable", slot, retrieved_at_utc=retrieved)
         if status != 200:
             self.stats.failed += 1
+            error = f"unexpected HTTP {status}"
+            self._attempted[slot.filename] = ("failed", retrieved, error)
             return CaptureResult(
-                task, "failed", slot, retrieved_at_utc=retrieved,
-                error=f"unexpected HTTP {status}",
+                task, "failed", slot, retrieved_at_utc=retrieved, error=error,
             )
 
         self.archive.store(

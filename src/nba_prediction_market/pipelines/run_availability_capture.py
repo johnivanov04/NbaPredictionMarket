@@ -163,7 +163,8 @@ def run_pipeline(
         runner = AvailabilityRunner(archive, store, fetch=PacedFetcher(client))
         results = runner.run(due, now=now)
 
-        unavailable = [r for r in results if r.status == "source_unavailable"]
+        # ``outcome`` is the canonical field; ``.status`` never existed.
+        unavailable = [r for r in results if r.outcome == "source_unavailable"]
         canary_ok = True
         if unavailable:
             canary_ok = canary_is_reachable(client)

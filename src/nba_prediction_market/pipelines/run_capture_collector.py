@@ -278,6 +278,11 @@ def fetch_orderbooks(
     return rows, observations
 
 
+def _task_key(task: Any) -> tuple[Any, str, str]:
+    """Identity of one planned capture, stable across ticks."""
+    return (task.game_id, task.source, task.capture_at_utc.isoformat())
+
+
 def _append_jsonl(path: Path, rows: list[dict[str, Any]]) -> None:
     if not rows:
         return
@@ -326,6 +331,12 @@ class Collector:
     last_polled: dict[Any, datetime] = field(default_factory=dict)
     last_identity_refresh: datetime | None = None
     last_referee_refresh: datetime | None = None
+    #: Planned captures already attempted this process, keyed by
+    #: ``(game_id, source, capture_at_utc)``. ``plan_captures`` schedules each
+    #: capture for a specific moment; without this, "due" means "its moment has
+    #: passed", so every task re-ran on every one-second tick and the same
+    #: report URL was requested once a second for as long as the slate lasted.
+    attempted_captures: set[tuple[Any, str, str]] = field(default_factory=set)
     capture_referees: bool = True
     referee_assignments: int = 0
     referee_failures: int = 0
@@ -427,21 +438,39 @@ class Collector:
             ],
             CAPTURE_SOURCES,
         )
-        due = [t for t in planned if t.capture_at_utc <= now]
+        # Each planned capture is attempted once. The nine offsets per game are
+        # the intended retry schedule, and the runner itself retries a transient
+        # error three times with backoff, so re-running a task every tick adds
+        # no coverage -- it only spends the rate-limit budget, and a throttled
+        # source answers 403, the same code it uses for "not published".
+        due = [
+            t for t in planned
+            if t.capture_at_utc <= now and _task_key(t) not in self.attempted_captures
+        ]
         if not due:
             return
+        for task in due:
+            self.attempted_captures.add(_task_key(task))
 
         runner = AvailabilityRunner(
             self.archive, self.store, fetch=PacedFetcher(client)
         )
         results = runner.run(due, now=now)
-        captured = [r for r in results if r.status == "captured"]
+        # ``CaptureResult.outcome``, not ``.status``. The runner has only ever
+        # exposed ``outcome`` -- ``anchor_health`` in the same module reads it --
+        # and this caller drifted. Nothing caught it because every earlier smoke
+        # test ran with no game inside the capture horizon, so ``due`` was empty
+        # and the code below was never reached.
+        captured = [r for r in results if r.outcome == "captured"]
         self.report_captures += len(captured)
+        # 403 means "not published" and is counted as ``unavailable``, not
+        # ``failed``, so an unpublished preseason report does not look like a
+        # fetch failure.
         self.failed_fetches += runner.stats.failed
         if captured:
             self.last_report_observation = now
 
-        unavailable = [r for r in results if r.status == "source_unavailable"]
+        unavailable = [r for r in results if r.outcome == "source_unavailable"]
         if unavailable:
             self.canary_ok = canary_is_reachable(client)
 
